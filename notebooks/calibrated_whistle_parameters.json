@@ -1,0 +1,15 @@
+{
+  "instrument": "High D soprano tin whistle",
+  "bore_radius_m": 0.0072,
+  "physical_length_m": 0.26361,
+  "mouthpiece_length_m": 0.021991361950235867,
+  "temperature_c": 20.0,
+  "radiation": "unflanged",
+  "calibration": {
+    "target_f1_hz": 587.33,
+    "simulated_f1_hz": 587.4437218609305,
+    "target_f2_hz": 1174.66,
+    "simulated_f2_hz": 1178.4892446223112,
+    "octave_deviation_cents": 5.299249590074855
+  }
+}
