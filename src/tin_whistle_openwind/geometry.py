@@ -114,3 +114,102 @@ class WhistleGeometryFactory:
     ) -> WhistleInstrument:
         bore = self.build_bore(mouthpiece, pipe)
         return WhistleInstrument(bore=bore, radiation=self.radiation, temperature=self.temperature)
+
+    def build_tapered_bore(
+        self, mouthpiece: MouthpieceGeometry | str, bore: "TaperedBoreGeometry"
+    ) -> list[tuple[float, float]]:
+        """Combine a mouthpiece with a (possibly tapered/belled) main bore profile."""
+        if isinstance(mouthpiece, str):
+            mouthpiece = self.load_mouthpiece(mouthpiece)
+        junction_position = mouthpiece.segments[-1][0]
+        junction_step = (junction_position, bore.segments[0][1])
+        offset_segments = [
+            (mouthpiece.l_mouth + position, radius) for position, radius in bore.segments[1:]
+        ]
+        return [*mouthpiece.segments, junction_step, *offset_segments]
+
+    def create_tapered_instrument(
+        self, mouthpiece: MouthpieceGeometry | str, bore: "TaperedBoreGeometry"
+    ) -> WhistleInstrument:
+        bore_points = self.build_tapered_bore(mouthpiece, bore)
+        return WhistleInstrument(bore=bore_points, radiation=self.radiation, temperature=self.temperature)
+
+
+@dataclass
+class TaperedBoreGeometry:
+    """A segmented (optionally tapered/belled) main bore, relative to the pipe's own start.
+
+    `segments` is a list of (position_m, radius_m) pairs; the first entry must be at
+    position 0.0 and set the nominal (cylindrical) bore radius at the mouthpiece junction.
+    """
+
+    name: str
+    segments: list[tuple[float, float]]
+
+    @property
+    def length_m(self) -> float:
+        return self.segments[-1][0]
+
+    @classmethod
+    def cylindrical(cls, name: str, radius_m: float, length_m: float) -> "TaperedBoreGeometry":
+        return cls(name=name, segments=[(0.0, radius_m), (length_m, radius_m)])
+
+    @classmethod
+    def with_bell_contraction(
+        cls,
+        name: str,
+        radius_m: float,
+        length_m: float,
+        bell_radius_m: float,
+        taper_start_fraction: float = 0.85,
+    ) -> "TaperedBoreGeometry":
+        """A cylindrical bore with a reverse-conical taper into a bell end-contraction."""
+        taper_start_m = length_m * taper_start_fraction
+        return cls(
+            name=name,
+            segments=[
+                (0.0, radius_m),
+                (taper_start_m, radius_m),
+                (length_m, bell_radius_m),
+            ],
+        )
+
+
+@dataclass
+class UndercutTonehole:
+    """A tonehole with an optional inner chimney bevel (undercut), 0-15 degrees."""
+
+    label: str
+    position_m: float
+    diameter_m: float
+    chimney_height_m: float
+    bevel_deg: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.bevel_deg <= 15.0:
+            raise ValueError(f"bevel_deg must be within [0, 15], got {self.bevel_deg}.")
+
+    @property
+    def radius_in_m(self) -> float:
+        """Chimney radius at the bore wall (unaffected by undercutting)."""
+        return self.diameter_m / 2.0
+
+    @property
+    def radius_out_m(self) -> float:
+        """Chimney radius at the outer (finger) side, flared by the undercut bevel."""
+        return self.radius_in_m + self.chimney_height_m * np.tan(np.radians(self.bevel_deg))
+
+    def to_row(self) -> list[Any]:
+        """An OpenWInD `holes_valves` data row (conical chimney via radius/radius_out)."""
+        return [
+            "hole",
+            self.label,
+            self.position_m,
+            self.radius_in_m,
+            self.radius_out_m,
+            self.chimney_height_m,
+        ]
+
+
+HOLES_VALVES_HEADER: list[str] = ["variety", "label", "position", "radius", "radius_out", "length"]
+
