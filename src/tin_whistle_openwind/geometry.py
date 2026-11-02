@@ -150,6 +150,22 @@ class TaperedBoreGeometry:
     def length_m(self) -> float:
         return self.segments[-1][0]
 
+    def with_length(self, length_m: float) -> "TaperedBoreGeometry":
+        """Resize the pipe while preserving radii and the terminal taper length."""
+        terminal_length = (
+            self.segments[-1][0] - self.segments[-2][0]
+            if len(self.segments) > 2 else 0.0
+        )
+        if not np.isfinite(length_m) or length_m <= terminal_length:
+            raise ValueError("Pipe length must exceed the terminal taper length.")
+        scale = (length_m - terminal_length) / (self.length_m - terminal_length)
+        return TaperedBoreGeometry(
+            name=self.name,
+            segments=[
+                (position * scale, radius) for position, radius in self.segments[:-1]
+            ] + [(length_m, self.segments[-1][1])],
+        )
+
     @classmethod
     def cylindrical(cls, name: str, radius_m: float, length_m: float) -> "TaperedBoreGeometry":
         return cls(name=name, segments=[(0.0, radius_m), (length_m, radius_m)])
@@ -212,4 +228,3 @@ class UndercutTonehole:
 
 
 HOLES_VALVES_HEADER: list[str] = ["variety", "label", "position", "radius", "radius_out", "length"]
-

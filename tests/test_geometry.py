@@ -11,6 +11,7 @@ import pytest
 from tin_whistle_openwind.geometry import (
     MouthpieceGeometry,
     PipeGeometry,
+    TaperedBoreGeometry,
     WhistleGeometryFactory,
     WhistleInstrument,
 )
@@ -32,6 +33,36 @@ def sample_pipe() -> PipeGeometry:
 
 def test_exit_radius_returns_last_segment_radius(sample_mouthpiece):
     assert sample_mouthpiece.exit_radius == pytest.approx(0.0065)
+
+
+@pytest.mark.parametrize("length_m", [0.24, 0.26])
+def test_resize_preserves_terminal_taper_and_radii(length_m):
+    bore = TaperedBoreGeometry(
+        "DN16", [(0.0, 0.0071), (0.23, 0.0071), (0.25, 0.0068)]
+    )
+    resized = bore.with_length(length_m)
+
+    assert resized.name == bore.name
+    assert resized.length_m == pytest.approx(length_m)
+    assert resized.segments[-2][0] == pytest.approx(length_m - 0.020)
+    assert [radius for _, radius in resized.segments] == [
+        radius for _, radius in bore.segments
+    ]
+    assert bore.length_m == pytest.approx(0.25)
+
+
+def test_resize_cylindrical_bore():
+    bore = TaperedBoreGeometry.cylindrical("DN16", 0.0071, 0.25)
+    assert bore.with_length(0.24).segments == [(0.0, 0.0071), (0.24, 0.0071)]
+
+
+@pytest.mark.parametrize("length_m", [0.0, -0.1, 0.01, float("nan"), float("inf")])
+def test_resize_rejects_invalid_length(length_m):
+    bore = TaperedBoreGeometry(
+        "DN16", [(0.0, 0.0071), (0.23, 0.0071), (0.25, 0.0068)]
+    )
+    with pytest.raises(ValueError, match="Pipe length"):
+        bore.with_length(length_m)
 
 
 def test_to_dict_serializes_segments_and_l_mouth(sample_mouthpiece):

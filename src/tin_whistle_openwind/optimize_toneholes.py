@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from .geometry import TaperedBoreGeometry, WhistleInstrument
+from .geometry import MouthpieceGeometry, TaperedBoreGeometry, WhistleInstrument
 from .keys import WhistleKeyConfig
 from .optimizer import (
     ACTIVE_HOLE_LABELS,
@@ -21,9 +21,19 @@ def optimize_toneholes(
     tuning: TuningProfile = IRISH_FOLK_HYBRID,
     initial_positions_m: Sequence[float] | None = None,
     initial_diameters_m: Sequence[float] | None = None,
+    mouthpiece: MouthpieceGeometry | None = None,
 ) -> ToneholeOptimizationResult:
-    """Run the Stage 2 six-hole position/diameter optimizer."""
-    pipe_length_m = key_config.approx_length_mm / 1000.0
+    """Fit holes and pipe length, including the calibrated mouthpiece.
+
+    For pipe-only bores, use ``result.bore`` for subsequent simulation/export:
+    the Stage 1 length changes to account for the closed tonehole cavities.
+    """
+    if mouthpiece is None and isinstance(bore, TaperedBoreGeometry):
+        mouthpiece = MouthpieceGeometry.load("MouthpieceDN16V2")
+    pipe_length_m = (
+        bore.length_m if isinstance(bore, TaperedBoreGeometry)
+        else key_config.approx_length_mm / 1000.0
+    )
     if initial_positions_m is None:
         reference_from_end_m = (0.1465, 0.1267, 0.1076, 0.0845, 0.0667, 0.0391)
         initial_positions_m = [
@@ -36,6 +46,6 @@ def optimize_toneholes(
         ]
     if initial_diameters_m is None:
         initial_diameters_m = REFERENCE_HOLE_DIAMETERS_M
-    return ToneholeOptimizer(key_config, tuning, bore).optimize(
+    return ToneholeOptimizer(key_config, tuning, bore, mouthpiece=mouthpiece).optimize(
         initial_positions_m, initial_diameters_m
     )

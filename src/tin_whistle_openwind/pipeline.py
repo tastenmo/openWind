@@ -8,7 +8,7 @@ from typing import Any
 
 from .geometry import PipeGeometry, TaperedBoreGeometry, UndercutTonehole, WhistleGeometryFactory
 from .keys import SUPPORTED_KEYS, WhistleKeyConfig, inner_radius_m, pipe_length_m, scale_mouthpiece_length_m
-from .optimize_bore import BoreOptimizationResult, optimize_bore
+from .optimize_bore import LengthEndholeOptimizationResult, optimize_length_endhole
 from .optimize_toneholes import optimize_toneholes
 from .optimize_undercut import UndercutOptimizationResult, optimize_undercut
 from .optimizer import ToneholeLayout, ToneholeOptimizationResult
@@ -59,21 +59,41 @@ class WhistleDesignPipeline:
         self.key_config: WhistleKeyConfig = SUPPORTED_KEYS[key_name]
         self.temperament = temperament
         self.geometry_factory = WhistleGeometryFactory(data_dir=data_dir) if data_dir else WhistleGeometryFactory()
-        self.bore_result: BoreOptimizationResult | None = None
+        self.bore_result: LengthEndholeOptimizationResult | None = None
         self.tonehole_result: ToneholeOptimizationResult | None = None
         self.undercut_result: UndercutOptimizationResult | None = None
 
-    def run_stage_1_bore_optimization(self) -> TaperedBoreGeometry:
-        self.bore_result = optimize_bore(self.key_config)
+    def run_stage_1_length_endhole_optimization(
+        self, starting_bore_radius_m: float | None = None
+    ) -> TaperedBoreGeometry:
+        mouthpiece = self.geometry_factory.load_mouthpiece("MouthpieceDN16V2")
+        self.bore_result = optimize_length_endhole(
+            self.key_config,
+            mouthpiece,
+            starting_bore_radius_m=starting_bore_radius_m,
+        )
         return self.bore_result.bore
 
     def run_stage_2_tonehole_optimization(self, bore: TaperedBoreGeometry) -> ToneholeLayout:
-        self.tonehole_result = optimize_toneholes(self.key_config, bore, self.temperament)
+        """Fit holes and length; the final bore is stored in ``tonehole_result.bore``."""
+        mouthpiece = self.geometry_factory.load_mouthpiece("MouthpieceDN16V2")
+        self.tonehole_result = optimize_toneholes(
+            self.key_config,
+            bore,
+            self.temperament,
+            mouthpiece=mouthpiece,
+        )
         return self.tonehole_result.layout
 
     def run_stage_3_undercut_optimization(
         self, bore: TaperedBoreGeometry, holes: ToneholeLayout
     ) -> FinalWhistleDesign:
+        if (
+            self.tonehole_result is not None
+            and holes is self.tonehole_result.layout
+            and bore != self.tonehole_result.bore
+        ):
+            raise ValueError("Use tonehole_result.bore after Stage 2, not the Stage 1 bore.")
         self.undercut_result = optimize_undercut(holes)
         return FinalWhistleDesign(
             key_name=self.key_config.name,

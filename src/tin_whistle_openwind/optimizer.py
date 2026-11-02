@@ -13,7 +13,14 @@ from openwind import ImpedanceComputation, Player
 from openwind import InstrumentGeometry, InstrumentPhysics
 from openwind.inversion import InverseFrequentialResponse
 
-from .geometry import HOLES_VALVES_HEADER, TaperedBoreGeometry, UndercutTonehole, WhistleInstrument
+from .geometry import (
+    HOLES_VALVES_HEADER,
+    MouthpieceGeometry,
+    TaperedBoreGeometry,
+    UndercutTonehole,
+    WhistleGeometryFactory,
+    WhistleInstrument,
+)
 from .keys import WhistleKeyConfig
 from .tuning import DEGREE_LABELS, STANDARD_FINGERINGS, TuningProfile, generate_key_frequencies
 
@@ -22,6 +29,7 @@ MIN_HOLE_DIAMETER_M = 0.005
 MAX_HOLE_DIAMETER_M = 0.008
 MIN_BOTTOM_END_DISTANCE_M = 0.030
 GEOMETRY_TOLERANCE_M = 1e-9
+ROOT_TUNING_TOLERANCE_CENTS = 0.1
 ACTIVE_HOLE_LABELS: tuple[str, ...] = ("L1", "L2", "L3", "R1", "R2", "R3")
 REFERENCE_HOLE_DIAMETERS_M: tuple[float, ...] = (0.0055, 0.0065, 0.0060, 0.0050, 0.0080, 0.0080)
 
@@ -69,6 +77,7 @@ class ToneholeOptimizationResult:
     final_cost: float
     improvement: float
     improved: bool
+    bore: TaperedBoreGeometry | WhistleInstrument | list[list[float]]
 
 
 @dataclass
@@ -141,11 +150,13 @@ class OpenWInDToneholeModel:
         layout: ToneholeLayout,
         temperature: float = 20.0,
         radiation: str = "unflanged",
+        hole_position_offset_m: float = 0.0,
     ) -> None:
         self.bore = bore
         self.layout = layout
         self.temperature = temperature
         self.radiation = radiation
+        self.hole_position_offset_m = hole_position_offset_m
 
     def _main_bore(self) -> object:
         if isinstance(self.bore, TaperedBoreGeometry):
@@ -160,10 +171,22 @@ class OpenWInDToneholeModel:
         note: str,
         fingerings: dict[str, list[int]] = STANDARD_FINGERINGS,
     ) -> np.ndarray:
+        layout = ToneholeLayout(
+            [
+                UndercutTonehole(
+                    hole.label,
+                    hole.position_m + self.hole_position_offset_m,
+                    hole.diameter_m,
+                    hole.chimney_height_m,
+                    hole.bevel_deg,
+                )
+                for hole in self.layout.holes
+            ]
+        )
         computation = ImpedanceComputation(
             frequencies_hz,
             self._main_bore(),
-            self.layout.to_openwind_rows(),
+            layout.to_openwind_rows(),
             fingering_chart_rows(fingerings),
             unit="m",
             player=Player("UNITARY_FLOW"),
@@ -279,7 +302,12 @@ class InverseToneholeOptimizer:
 
 
 class ToneholeOptimizer:
-    """Optimize positions/diameters against OpenWInD admittance peak targets."""
+    """Fit hole positions/diameters and pipe length to admittance peak targets.
+
+    Pipe-only ``TaperedBoreGeometry`` inputs allow length adjustment within 5%
+    of the starting length, keeping all radii and the terminal taper fixed.
+    Assembled instruments and raw bore lists retain their fixed geometry.
+    """
 
     def __init__(
         self,
@@ -287,11 +315,47 @@ class ToneholeOptimizer:
         tuning: TuningProfile,
         bore: TaperedBoreGeometry | WhistleInstrument | list[list[float]],
         temperature: float = 20.0,
+        mouthpiece: MouthpieceGeometry | None = None,
     ) -> None:
         self.key_config = key_config
         self.tuning = tuning
         self.bore = bore
         self.temperature = temperature
+        self.mouthpiece = mouthpiece
+        self.pipe_length_m = (
+            bore.length_m if isinstance(bore, TaperedBoreGeometry)
+            else key_config.approx_length_mm / 1000.0
+        )
+        self.acoustic_bore = bore
+        if mouthpiece is not None and isinstance(bore, TaperedBoreGeometry):
+            factory = WhistleGeometryFactory(temperature=temperature)
+            self.acoustic_bore = factory.create_tapered_instrument(mouthpiece, bore)
+
+    def _optimized_bore(
+        self, vector: np.ndarray
+    ) -> TaperedBoreGeometry | WhistleInstrument | list[list[float]]:
+        if isinstance(self.bore, TaperedBoreGeometry) and len(vector) == 13:
+            return self.bore.with_length(float(vector[12]))
+        return self.bore
+
+    def _model(
+        self,
+        layout: ToneholeLayout,
+        bore: TaperedBoreGeometry | WhistleInstrument | list[list[float]] | None = None,
+    ) -> OpenWInDToneholeModel:
+        acoustic_bore = self.acoustic_bore
+        if bore is not None:
+            acoustic_bore = bore
+            if self.mouthpiece is not None and isinstance(bore, TaperedBoreGeometry):
+                acoustic_bore = WhistleGeometryFactory(
+                    temperature=self.temperature
+                ).create_tapered_instrument(self.mouthpiece, bore)
+        return OpenWInDToneholeModel(
+            acoustic_bore,
+            layout,
+            self.temperature,
+            hole_position_offset_m=self.mouthpiece.l_mouth if self.mouthpiece else 0.0,
+        )
 
     def targets_hz(self) -> dict[str, float]:
         return generate_key_frequencies(self.key_config, "12-TET")
@@ -303,19 +367,22 @@ class ToneholeOptimizer:
         ]
         return ToneholeLayout(holes)
 
+    def _cent_error(self, model: OpenWInDToneholeModel, note: str) -> float:
+        target = self.tuning.get_target_frequency(note, self.targets_hz()[note])
+        response = model.response(
+            note,
+            target,
+            f_min=0.75 * target,
+            f_max=1.25 * target,
+            n_points=300,
+        )
+        return float(1200.0 * np.log2(response.peak_frequency_hz / target))
+
     def objective(self, vector: np.ndarray, notes: Sequence[str]) -> float:
-        pipe_length_m = self.key_config.approx_length_mm / 1000.0
         try:
             layout = self._layout(vector)
-            layout.validate(pipe_length_m)
-            model = OpenWInDToneholeModel(self.bore, layout, self.temperature)
-            targets = self.targets_hz()
-            error = 0.0
-            for note in notes:
-                response = model.response(note, targets[note])
-                target = self.tuning.get_target_frequency(note, targets[note])
-                error += (1200.0 * np.log2(response.peak_frequency_hz / target)) ** 2
-            return float(error)
+            model = self._model(layout, self._optimized_bore(vector))
+            return sum(self._cent_error(model, note) ** 2 for note in notes)
         except (ValueError, RuntimeError, IndexError, KeyError):
             return 1e12
 
@@ -327,8 +394,13 @@ class ToneholeOptimizer:
     ) -> ToneholeOptimizationResult:
         notes = list(notes or DEGREE_LABELS)
         x0 = np.r_[initial_positions_m, initial_diameters_m]
-        pipe_length_m = self.key_config.approx_length_mm / 1000.0
-        bounds = [(0.018 * (index + 1), pipe_length_m - MIN_BOTTOM_END_DISTANCE_M) for index in range(6)]
+        pipe_length_m = self.pipe_length_m
+        optimize_length = isinstance(self.bore, TaperedBoreGeometry)
+        max_pipe_length_m = 1.05 * pipe_length_m if optimize_length else pipe_length_m
+        bounds = [
+            (0.018 * (index + 1), max_pipe_length_m - MIN_BOTTOM_END_DISTANCE_M)
+            for index in range(6)
+        ]
         bounds += [(MIN_HOLE_DIAMETER_M, MAX_HOLE_DIAMETER_M)] * 6
         diameter_margin = 1e-6
         x0[6:] = np.clip(
@@ -336,25 +408,81 @@ class ToneholeOptimizer:
             MIN_HOLE_DIAMETER_M + diameter_margin,
             MAX_HOLE_DIAMETER_M - diameter_margin,
         )
+        self._layout(x0).validate(pipe_length_m)
+        if optimize_length:
+            x0 = np.r_[x0, pipe_length_m]
+            bounds.append((0.95 * pipe_length_m, max_pipe_length_m))
         initial_cost = self.objective(x0, notes)
-        constraints = [{"type": "ineq", "fun": lambda vector, i=i: vector[i + 1] - vector[i] - MIN_HOLE_SPACING_M + GEOMETRY_TOLERANCE_M} for i in range(5)]
-        result = minimize(
-            lambda vector: self.objective(vector, notes),
-            x0,
-            method="SLSQP",
-            bounds=bounds,
-            constraints=constraints,
-            options={"ftol": 1e-4, "maxiter": 100, "eps": 1e-4, "disp": False},
-        )
-        layout = self._layout(result.x)
-        cent_errors = {
-            note: 1200.0 * np.log2(
-                OpenWInDToneholeModel(self.bore, layout, self.temperature).response(note, self.targets_hz()[note]).peak_frequency_hz
-                / self.tuning.get_target_frequency(note, self.targets_hz()[note])
+        parameter_scale = 1000.0
+        scaled_x0 = x0 * parameter_scale
+        scaled_bounds = [
+            (lower * parameter_scale, upper * parameter_scale)
+            for lower, upper in bounds
+        ]
+        constraints = [
+            {
+                "type": "ineq",
+                "fun": lambda vector, i=i: (
+                    vector[i + 1]
+                    - vector[i]
+                    - (MIN_HOLE_SPACING_M + 1e-4) * parameter_scale
+                ),
+            }
+            for i in range(5)
+        ]
+        if optimize_length:
+            constraints.append(
+                {
+                    "type": "ineq",
+                    "fun": lambda vector: (
+                        vector[12] - vector[5]
+                        - (MIN_BOTTOM_END_DISTANCE_M + 1e-4) * parameter_scale
+                    ),
+                }
             )
-            for note in notes
-        }
-        final_cost = float(result.fun)
+            if "Degree_1" in notes:
+                def closed_root_error(scaled_vector: np.ndarray) -> float:
+                    vector = scaled_vector / parameter_scale
+                    model = self._model(self._layout(vector), self._optimized_bore(vector))
+                    return self._cent_error(model, "Degree_1")
+
+                constraints.append(
+                    {
+                        "type": "ineq",
+                        "fun": lambda vector: (
+                            ROOT_TUNING_TOLERANCE_CENTS - abs(closed_root_error(vector))
+                        ),
+                    }
+                )
+        result = minimize(
+            lambda vector: self.objective(vector / parameter_scale, notes) / 1000.0,
+            scaled_x0,
+            method="SLSQP",
+            bounds=scaled_bounds,
+            constraints=constraints,
+            options={
+                "ftol": 1e-5,
+                "maxiter": 100 if optimize_length else 50,
+                "eps": 0.001 if optimize_length else 0.01,
+                "disp": False,
+            },
+        )
+        optimized_vector = result.x / parameter_scale
+        final_cost = self.objective(optimized_vector, notes)
+        if not result.success:
+            raise RuntimeError(f"Tonehole optimization failed: {result.message}")
+        layout = self._layout(optimized_vector)
+        optimized_bore = self._optimized_bore(optimized_vector)
+        layout.validate(
+            optimized_bore.length_m
+            if isinstance(optimized_bore, TaperedBoreGeometry) else pipe_length_m
+        )
+        result.x = optimized_vector
+        result.fun = final_cost
+        if result.jac is not None:
+            result.jac = np.asarray(result.jac) * parameter_scale * 1000.0
+        model = self._model(layout, optimized_bore)
+        cent_errors = {note: self._cent_error(model, note) for note in notes}
         improvement = float(initial_cost - final_cost)
         improved = improvement > max(1e-6, abs(initial_cost) * 1e-9)
         return ToneholeOptimizationResult(
@@ -365,4 +493,5 @@ class ToneholeOptimizer:
             final_cost=final_cost,
             improvement=improvement,
             improved=improved,
+            bore=optimized_bore,
         )

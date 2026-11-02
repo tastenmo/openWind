@@ -2,58 +2,62 @@
   "key_name": "Soprano High D",
   "temperament": "Irish Folk Hybrid (HB-trad / Copeland standard)",
   "bore": {
-    "name": "Soprano High D cylindrical bore",
+    "name": "Soprano High D optimized bore",
     "segments": [
       [
         0.0,
-        0.0072
+        0.0070999999999999995
       ],
       [
-        0.26361,
-        0.0072
+        0.226123292643123,
+        0.0070999999999999995
+      ],
+      [
+        0.246123292643123,
+        0.0070999999999999735
       ]
     ]
   },
   "holes": [
     {
       "label": "L1",
-      "position_m": 0.11711000000000002,
-      "diameter_m": 0.0055,
+      "position_m": 0.10202492094290286,
+      "diameter_m": 0.007319290742517209,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     },
     {
       "label": "L2",
-      "position_m": 0.13691,
-      "diameter_m": 0.0065,
+      "position_m": 0.12012492094290285,
+      "diameter_m": 0.007207239472311708,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     },
     {
       "label": "L3",
-      "position_m": 0.15601,
-      "diameter_m": 0.006,
+      "position_m": 0.13822492094290287,
+      "diameter_m": 0.006795198905760201,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     },
     {
       "label": "R1",
-      "position_m": 0.17911,
-      "diameter_m": 0.005001,
+      "position_m": 0.15980436596949585,
+      "diameter_m": 0.005257218683255897,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     },
     {
       "label": "R2",
-      "position_m": 0.19760999999999998,
-      "diameter_m": 0.007999000000000001,
+      "position_m": 0.17790436596949585,
+      "diameter_m": 0.008,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     },
     {
       "label": "R3",
-      "position_m": 0.22451000000000002,
-      "diameter_m": 0.007999000000000001,
+      "position_m": 0.2032689838877266,
+      "diameter_m": 0.007999999999999998,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     }
