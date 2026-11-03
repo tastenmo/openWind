@@ -25,6 +25,10 @@ from .keys import WhistleKeyConfig
 from .tuning import DEGREE_LABELS, STANDARD_FINGERINGS, TuningProfile, generate_key_frequencies
 
 MIN_HOLE_SPACING_M = 0.018
+MIN_ADJACENT_HOLE_SPACINGS_M = (
+    MIN_HOLE_SPACING_M, MIN_HOLE_SPACING_M, 0.0,
+    MIN_HOLE_SPACING_M, MIN_HOLE_SPACING_M,
+)
 MIN_HOLE_DIAMETER_M = 0.005
 MAX_HOLE_DIAMETER_M = 0.008
 MIN_BOTTOM_END_DISTANCE_M = 0.030
@@ -53,8 +57,13 @@ class ToneholeLayout:
         diameters = self.diameters_m
         if len(positions) != 6:
             raise ValueError("A six-hole whistle layout is required.")
-        if np.any(np.diff(positions) < MIN_HOLE_SPACING_M - GEOMETRY_TOLERANCE_M):
-            raise ValueError("Adjacent toneholes must be at least 18 mm apart.")
+        if np.any(np.diff(positions) <= 0):
+            raise ValueError("Toneholes must remain ordered from L1 to R3.")
+        if np.any(
+            np.diff(positions)
+            < np.asarray(MIN_ADJACENT_HOLE_SPACINGS_M) - GEOMETRY_TOLERANCE_M
+        ):
+            raise ValueError("Adjacent toneholes within each hand must be at least 18 mm apart.")
         if np.any((diameters < MIN_HOLE_DIAMETER_M) | (diameters > MAX_HOLE_DIAMETER_M)):
             raise ValueError("Tonehole diameters must be between 5 and 8 mm.")
         if pipe_length_m - positions[-1] < MIN_BOTTOM_END_DISTANCE_M - GEOMETRY_TOLERANCE_M:
@@ -269,7 +278,12 @@ class InverseToneholeOptimizer:
 
         fingerings = fingering_chart_rows(hole_labels=ACTIVE_HOLE_LABELS)
         geometry = InstrumentGeometry(self._main_bore(), self._inverse_holes(), fingerings)
-        geometry.constrain_all_holes_distance(Lmin=min_hole_spacing_m)
+        for index, (first, second) in enumerate(
+            zip(ACTIVE_HOLE_LABELS, ACTIVE_HOLE_LABELS[1:])
+        ):
+            geometry.constrain_2_holes_distance(
+                first, second, Lmin=1e-4 if index == 2 else min_hole_spacing_m
+            )
         physics = InstrumentPhysics(
             geometry,
             self.temperature,
@@ -398,7 +412,10 @@ class ToneholeOptimizer:
         optimize_length = isinstance(self.bore, TaperedBoreGeometry)
         max_pipe_length_m = 1.05 * pipe_length_m if optimize_length else pipe_length_m
         bounds = [
-            (0.018 * (index + 1), max_pipe_length_m - MIN_BOTTOM_END_DISTANCE_M)
+            (
+                MIN_HOLE_SPACING_M + sum(MIN_ADJACENT_HOLE_SPACINGS_M[:index]),
+                max_pipe_length_m - MIN_BOTTOM_END_DISTANCE_M,
+            )
             for index in range(6)
         ]
         bounds += [(MIN_HOLE_DIAMETER_M, MAX_HOLE_DIAMETER_M)] * 6
@@ -425,7 +442,7 @@ class ToneholeOptimizer:
                 "fun": lambda vector, i=i: (
                     vector[i + 1]
                     - vector[i]
-                    - (MIN_HOLE_SPACING_M + 1e-4) * parameter_scale
+                    - (MIN_ADJACENT_HOLE_SPACINGS_M[i] + 1e-4) * parameter_scale
                 ),
             }
             for i in range(5)

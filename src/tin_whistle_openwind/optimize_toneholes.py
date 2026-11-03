@@ -8,6 +8,7 @@ from .geometry import MouthpieceGeometry, TaperedBoreGeometry, WhistleInstrument
 from .keys import WhistleKeyConfig
 from .optimizer import (
     ACTIVE_HOLE_LABELS,
+    MIN_ADJACENT_HOLE_SPACINGS_M,
     REFERENCE_HOLE_DIAMETERS_M,
     ToneholeOptimizationResult,
     ToneholeOptimizer,
@@ -40,7 +41,11 @@ def optimize_toneholes(
             pipe_length_m - from_end for from_end in reference_from_end_m
         ]
         initial_positions_m = [
-            max(position, initial_positions_m[index - 1] + 0.0185)
+            max(
+                position,
+                initial_positions_m[index - 1]
+                + MIN_ADJACENT_HOLE_SPACINGS_M[index - 1] + 0.0005,
+            )
             if index > 0 else position
             for index, position in enumerate(initial_positions_m)
         ]

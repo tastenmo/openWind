@@ -41,9 +41,26 @@ same mouthpiece geometry and offsets hole positions into the combined instrument
 coordinate system. After Stage 2, use `pipeline.tonehole_result.bore` for tables,
 simulation and Stage 3/export, rather than the provisional Stage 1 bore.
 
+The 18 mm minimum tonehole spacing applies within each hand only (L1-L2,
+L2-L3, R1-R2, R2-R3), including measured-impedance inversion. There is no
+18 mm minimum between L3 and R1; optimization retains their axial order with
+a 0.1 mm numerical clearance. This is not a drill-edge clearance constraint.
+
 The multi-key notebook displays a millimeter drilling table (positions relative
 to the pipe start) and separate fingering/tuning tables for both registers.
 Each register is simulated independently, including the fork and the vented
 upper root. Signed cent errors use the selected temperament; missing resonance
 peaks are marked explicitly. This evaluation does not add upper-register notes
 to the optimization objective.
+
+Section 5 of the multi-key notebook compares actual impedance and admittance
+spectra for all nine standard fingerings (including fork and vented upper root),
+using the final design and calibrated mouthpiece. All interior peaks in the
+displayed frequency range are tabulated with absolute SI amplitude, half-power
+crossings, bandwidth and Q = peak frequency / bandwidth. The threshold is
+peak amplitude / sqrt(2), not half prominence. Separate plots compare spectra,
+peak heights and Q for Z and Y; flute playing resonances are admittance peaks,
+not impedance maxima. Missing crossings and bandwidths spanning fewer than eight
+grid intervals have no reported Q and an explicit status. These are bandwidth
+estimates for isolated model resonances, not measured playing stability or
+modal-fit Q values. Reduce `SPECTRUM_STEP_HZ` to check numerical convergence.
