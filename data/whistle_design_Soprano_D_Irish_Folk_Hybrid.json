@@ -9,60 +9,58 @@
         0.0070999999999999995
       ],
       [
-        0.226123292643123,
+        0.24115815871667617,
         0.0070999999999999995
-      ],
-      [
-        0.246123292643123,
-        0.0070999999999999735
       ]
     ]
   },
   "holes": [
     {
       "label": "L1",
-      "position_m": 0.10202492094290286,
-      "diameter_m": 0.007319290742517209,
+      "position_m": 0.0991220973778799,
+      "diameter_m": 0.007371852398919964,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     },
     {
       "label": "L2",
-      "position_m": 0.12012492094290285,
-      "diameter_m": 0.007207239472311708,
+      "position_m": 0.11722209737787989,
+      "diameter_m": 0.007411032848974513,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     },
     {
       "label": "L3",
-      "position_m": 0.13822492094290287,
-      "diameter_m": 0.006795198905760201,
+      "position_m": 0.1353220973778799,
+      "diameter_m": 0.007099600039080669,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     },
     {
       "label": "R1",
-      "position_m": 0.15980436596949585,
-      "diameter_m": 0.005257218683255897,
+      "position_m": 0.15546660900780543,
+      "diameter_m": 0.005240075300448012,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     },
     {
       "label": "R2",
-      "position_m": 0.17790436596949585,
+      "position_m": 0.17356660900780543,
       "diameter_m": 0.008,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     },
     {
       "label": "R3",
-      "position_m": 0.2032689838877266,
+      "position_m": 0.19854927888529667,
       "diameter_m": 0.007999999999999998,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     }
   ],
   "metadata": {
-    "root_note": "D5"
+    "root_note": "D5",
+    "mouthpiece_name": "MouthpieceDN16V4",
+    "endhole_optimized": false
   }
 }

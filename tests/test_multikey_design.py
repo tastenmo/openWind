@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import math
+from types import SimpleNamespace
 
 import pytest
 
+import tin_whistle_openwind.pipeline as pipeline_module
 from tin_whistle_openwind.geometry import TaperedBoreGeometry, UndercutTonehole
 from tin_whistle_openwind.keys import (
     SUPPORTED_KEYS,
@@ -14,7 +16,11 @@ from tin_whistle_openwind.keys import (
 )
 from tin_whistle_openwind.pipeline import WhistleDesignPipeline
 from tin_whistle_openwind.optimize_bore import optimize_length_endhole
-from tin_whistle_openwind.optimizer import ACTIVE_HOLE_LABELS, REFERENCE_HOLE_DIAMETERS_M
+from tin_whistle_openwind.optimizer import (
+    ACTIVE_HOLE_LABELS,
+    REFERENCE_HOLE_DIAMETERS_M,
+    ToneholeLayout,
+)
 from tin_whistle_openwind.reporting import drilling_chart_rows, fingering_tuning_rows
 from tin_whistle_openwind.tuning import (
     IRISH_FOLK_HYBRID,
@@ -53,6 +59,19 @@ def test_length_endhole_optimizer_accepts_custom_starting_bore():
     assert result.bore.segments[0][1] == pytest.approx(0.007)
     assert result.bore.segments[1][1] == pytest.approx(0.007)
     assert result.bore.segments[-1][0] - result.bore.segments[-2][0] == pytest.approx(0.020)
+
+
+def test_length_endhole_optimizer_can_use_straight_pvc_bore():
+    radius_m = 0.0071
+    result = optimize_length_endhole(
+        SUPPORTED_KEYS["Soprano_D"],
+        starting_bore_radius_m=radius_m,
+        optimize_endhole=False,
+    )
+
+    assert len(result.bore.segments) == 2
+    assert [radius for _, radius in result.bore.segments] == pytest.approx([radius_m, radius_m])
+    assert result.final_cost < result.initial_cost
 
 
 def test_length_endhole_optimizer_rejects_nonpositive_starting_bore():
@@ -159,3 +178,46 @@ def test_pipeline_stage_outputs(record_property):
 def test_key_validation():
     with pytest.raises(KeyError):
         WhistleDesignPipeline("not-a-key")
+
+
+def test_pipeline_uses_requested_mouthpiece_through_all_stages(monkeypatch):
+    pipeline = WhistleDesignPipeline(
+        "Soprano_D",
+        mouthpiece_name="MouthpieceDN16V4",
+        optimize_endhole=False,
+    )
+    bore = TaperedBoreGeometry.cylindrical("test bore", 0.0071, 0.24)
+    layout = ToneholeLayout([])
+    optimized_mouthpieces = []
+
+    assert pipeline.mouthpiece.name == "MouthpieceDN16V4"
+    assert pipeline.mouthpiece.segments[-1][0] == pytest.approx(0.035)
+
+    def fake_optimize_length_endhole(
+        key_config, mouthpiece, starting_bore_radius_m=None, optimize_endhole=True
+    ):
+        optimized_mouthpieces.append((mouthpiece, optimize_endhole))
+        return SimpleNamespace(bore=bore)
+
+    def fake_optimize_toneholes(key_config, optimized_bore, temperament, mouthpiece=None):
+        optimized_mouthpieces.append(mouthpiece)
+        return SimpleNamespace(layout=layout, bore=bore)
+
+    monkeypatch.setattr(pipeline_module, "optimize_length_endhole", fake_optimize_length_endhole)
+    monkeypatch.setattr(pipeline_module, "optimize_toneholes", fake_optimize_toneholes)
+    monkeypatch.setattr(
+        pipeline_module,
+        "optimize_undercut",
+        lambda optimized_layout: SimpleNamespace(layout=optimized_layout),
+    )
+
+    pipeline.run_stage_1_length_endhole_optimization()
+    pipeline.run_stage_2_tonehole_optimization(bore)
+    design = pipeline.run_stage_3_undercut_optimization(bore, layout)
+
+    assert optimized_mouthpieces == [
+        (pipeline.mouthpiece, False),
+        pipeline.mouthpiece,
+    ]
+    assert design.metadata["mouthpiece_name"] == "MouthpieceDN16V4"
+    assert design.metadata["endhole_optimized"] is False

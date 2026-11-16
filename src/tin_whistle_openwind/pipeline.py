@@ -53,12 +53,16 @@ class WhistleDesignPipeline:
         key_name: str,
         temperament: TuningProfile = IRISH_FOLK_HYBRID,
         data_dir: Path | None = None,
+        mouthpiece_name: str = "MouthpieceDN16V2",
+        optimize_endhole: bool = True,
     ) -> None:
         if key_name not in SUPPORTED_KEYS:
             raise KeyError(f"Unsupported key {key_name!r}; choose from {sorted(SUPPORTED_KEYS)}.")
         self.key_config: WhistleKeyConfig = SUPPORTED_KEYS[key_name]
         self.temperament = temperament
         self.geometry_factory = WhistleGeometryFactory(data_dir=data_dir) if data_dir else WhistleGeometryFactory()
+        self.mouthpiece = self.geometry_factory.load_mouthpiece(mouthpiece_name)
+        self.optimize_endhole = optimize_endhole
         self.bore_result: LengthEndholeOptimizationResult | None = None
         self.tonehole_result: ToneholeOptimizationResult | None = None
         self.undercut_result: UndercutOptimizationResult | None = None
@@ -66,22 +70,21 @@ class WhistleDesignPipeline:
     def run_stage_1_length_endhole_optimization(
         self, starting_bore_radius_m: float | None = None
     ) -> TaperedBoreGeometry:
-        mouthpiece = self.geometry_factory.load_mouthpiece("MouthpieceDN16V2")
         self.bore_result = optimize_length_endhole(
             self.key_config,
-            mouthpiece,
+            self.mouthpiece,
             starting_bore_radius_m=starting_bore_radius_m,
+            optimize_endhole=self.optimize_endhole,
         )
         return self.bore_result.bore
 
     def run_stage_2_tonehole_optimization(self, bore: TaperedBoreGeometry) -> ToneholeLayout:
         """Fit holes and length; the final bore is stored in ``tonehole_result.bore``."""
-        mouthpiece = self.geometry_factory.load_mouthpiece("MouthpieceDN16V2")
         self.tonehole_result = optimize_toneholes(
             self.key_config,
             bore,
             self.temperament,
-            mouthpiece=mouthpiece,
+            mouthpiece=self.mouthpiece,
         )
         return self.tonehole_result.layout
 
@@ -101,5 +104,9 @@ class WhistleDesignPipeline:
             bore=bore,
             holes=self.undercut_result.layout,
             undercut=self.undercut_result,
-            metadata={"root_note": self.key_config.root_note},
+            metadata={
+                "root_note": self.key_config.root_note,
+                "mouthpiece_name": self.mouthpiece.name,
+                "endhole_optimized": self.optimize_endhole,
+            },
         )

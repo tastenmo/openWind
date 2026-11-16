@@ -72,11 +72,14 @@ def optimize_length_endhole(
     mouthpiece: MouthpieceGeometry | None = None,
     starting_bore_radius_m: float | None = None,
     temperature: float = DEFAULT_TEMPERATURE,
+    optimize_endhole: bool = True,
 ) -> LengthEndholeOptimizationResult:
-    """Fit pipe length and terminal radius with a fixed 20 mm end taper.
+    """Fit pipe length and optionally the terminal radius with a 20 mm end taper.
 
     By default the pipe starts at the mouthpiece exit radius. Set
     ``starting_bore_radius_m`` to use a different constant main-pipe radius.
+    When ``optimize_endhole`` is false, the pipe is cylindrical and only its
+    length is optimized.
     """
     mouthpiece = mouthpiece or MouthpieceGeometry.load("MouthpieceDN16V2")
     starting_radius_m = (
@@ -94,13 +97,22 @@ def optimize_length_endhole(
     taper_length_m = 0.020
 
     def make_bore(parameters: np.ndarray) -> TaperedBoreGeometry:
-        length_m, end_radius_m = parameters
+        length_m = float(parameters[0])
+        if not optimize_endhole:
+            return TaperedBoreGeometry(
+                name=f"{key_config.name} optimized bore",
+                segments=[
+                    (0.0, starting_radius_m),
+                    (length_m, starting_radius_m),
+                ],
+            )
+        end_radius_m = float(parameters[1])
         return TaperedBoreGeometry(
             name=f"{key_config.name} optimized bore",
             segments=[
                 (0.0, starting_radius_m),
-                (float(length_m - taper_length_m), starting_radius_m),
-                (float(length_m), float(end_radius_m)),
+                (length_m - taper_length_m, starting_radius_m),
+                (length_m, end_radius_m),
             ],
         )
 
@@ -140,18 +152,30 @@ def optimize_length_endhole(
             2.0 * interval_error
         ])
 
-    initial_parameters = np.array([initial_pipe_length_m, 0.95 * starting_radius_m])
+    initial_parameters = (
+        np.array([initial_pipe_length_m, 0.95 * starting_radius_m])
+        if optimize_endhole else np.array([initial_pipe_length_m])
+    )
     initial_frequencies = get_resonances(initial_parameters)
     initial_residuals = residuals(initial_parameters)
     initial_cost = float(initial_residuals @ initial_residuals)
+    lower_bounds = (
+        [max(0.75 * initial_pipe_length_m, taper_length_m), 0.75 * starting_radius_m]
+        if optimize_endhole else [0.75 * initial_pipe_length_m]
+    )
+    upper_bounds = (
+        [1.25 * initial_pipe_length_m, 1.0 * starting_radius_m]
+        if optimize_endhole else [1.25 * initial_pipe_length_m]
+    )
+    parameter_scale = (
+        [initial_pipe_length_m, starting_radius_m]
+        if optimize_endhole else [initial_pipe_length_m]
+    )
     result = least_squares(
         residuals,
         initial_parameters,
-        bounds=(
-            [max(0.75 * initial_pipe_length_m, taper_length_m), 0.75 * starting_radius_m],
-            [1.25 * initial_pipe_length_m, 1.0 * starting_radius_m],
-        ),
-        x_scale=[initial_pipe_length_m, starting_radius_m],
+        bounds=(lower_bounds, upper_bounds),
+        x_scale=parameter_scale,
         ftol=1e-8,
         xtol=1e-8,
         gtol=1e-8,
@@ -177,9 +201,15 @@ def optimize_bore(
     key_config: WhistleKeyConfig,
     mouthpiece: MouthpieceGeometry | None = None,
     temperature: float = DEFAULT_TEMPERATURE,
+    optimize_endhole: bool = True,
 ) -> LengthEndholeOptimizationResult:
     """Compatibility wrapper for the Stage 1 length/endhole optimization."""
-    return optimize_length_endhole(key_config, mouthpiece, temperature=temperature)
+    return optimize_length_endhole(
+        key_config,
+        mouthpiece,
+        temperature=temperature,
+        optimize_endhole=optimize_endhole,
+    )
 
 
 BoreOptimizationResult = LengthEndholeOptimizationResult

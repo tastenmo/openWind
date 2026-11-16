@@ -22,18 +22,24 @@ Open `notebooks/01_geometry_and_fingering.ipynb` first. Replace the placeholder 
 - `artifacts/`: generated figures and tables
 - `tests/`: focused regression tests
 
-Stage 1 loads `data/MouthpieceDN16V2.json` by default, uses its 6.5 mm exit
-radius as the constant main-pipe bore, and optimizes only pipe length and
-terminal radius against the key's root and octave resonances. A linear taper to
-the optimized end radius occupies the final 20 mm. Pass
+The pipeline loads `data/MouthpieceDN16V2.json` by default; pass
+`mouthpiece_name="MouthpieceDN16V4"` to `WhistleDesignPipeline` to select the
+alternate calibrated geometry. The selected mouthpiece is used consistently
+in both optimization stages and recorded in the exported design metadata.
+Stage 1 uses the mouthpiece's 6.5 mm exit radius as the constant main-pipe bore
+unless a starting radius is supplied. By default it optimizes pipe length and
+terminal radius against the key's root and octave resonances, with a linear
+20 mm end taper. Set `optimize_endhole=False` on `WhistleDesignPipeline` for a
+straight PVC bore; then Stage 1 optimizes length only and keeps the pipe radius
+constant through its open end. Pass
 `starting_bore_radius_m` to `run_stage_1_length_endhole_optimization` to choose
 a different main-pipe radius. The multi-key notebook uses DN16 PVC with a
 14.2 mm inner diameter (7.1 mm radius); the calibrated mouthpiece stays unchanged.
 
 Stage 1 provides a provisional length for the unperforated pipe. Stage 2 jointly
 optimizes tonehole positions, diameters and pipe length (within +/-5% of Stage 1),
-accounting for the acoustic loading of closed tonehole cavities. Bore radii and
-the final 20 mm taper remain unchanged. The all-closed fundamental is constrained
+accounting for the acoustic loading of closed tonehole cavities. The Stage 1 bore
+profile remains unchanged. The all-closed fundamental is constrained
 to within 0.1 cent of its tuning target in the optimization sweep, rather than
 traded off against the other notes.
 Its acoustic simulation includes the
