@@ -29,8 +29,8 @@ def test_drilling_chart_uses_pipe_coordinates_and_millimeters(layout):
 def test_both_registers_use_measured_peaks_and_vented_upper_root(layout, monkeypatch):
     calls = []
 
-    def impedance(model, frequencies, note):
-        calls.append((model, note))
+    def impedance(model, frequencies, note, fingerings=None):
+        calls.append((model, note, fingerings))
         target = (frequencies[0] + frequencies[-1]) / 2.0
         # A distinct +12 cent upper-register resonance must not be derived by doubling.
         center = target * 2.0 ** ((12.0 if len(calls) > 8 else -3.0) / 1200.0)
@@ -42,7 +42,7 @@ def test_both_registers_use_measured_peaks_and_vented_upper_root(layout, monkeyp
     rows = fingering_tuning_rows(
         SUPPORTED_KEYS["Soprano_D"], IRISH_FOLK_HYBRID, bore, layout, mouthpiece
     )
-    assert len(rows) == 16
+    assert len(rows) == 19
     assert rows[0]["Deviation (cents)"] == pytest.approx(-3.0, abs=0.1)
     assert rows[8]["Deviation (cents)"] == pytest.approx(12.0, abs=0.1)
     assert rows[0]["L1"] == "x"
@@ -53,13 +53,41 @@ def test_both_registers_use_measured_peaks_and_vented_upper_root(layout, monkeyp
     targets = generate_key_frequencies(SUPPORTED_KEYS["Soprano_D"], IRISH_FOLK_HYBRID)
     assert rows[9]["Target (Hz)"] == pytest.approx(2 * targets["Degree_2"])
     assert sum(row["Degree"] == "Fork_Minor7" for row in rows) == 2
+    alternate_fingerings = {
+        row["Degree"]: row for row in rows
+        if row["Degree"] in {"Fork_Minor7_Alt1", "Fork_Minor7_Alt2"}
+    }
+    assert len(alternate_fingerings) == 2
+    for degree, expected_fingering in {
+        "Fork_Minor7_Alt1": ["o", "x", "x", "x", "o", "o"],
+        "Fork_Minor7_Alt2": ["o", "x", "x", "x", "o", "x"],
+    }.items():
+        row = alternate_fingerings[degree]
+        assert row["Register"] == 2
+        assert row["Target (Hz)"] == pytest.approx(2 * targets["Fork_Minor7"])
+        assert [row[label] for label in ACTIVE_HOLE_LABELS] == expected_fingering
+        assert next(call for call in calls if call[1] == degree)[2] == {
+            degree: [int(value == "x") for value in expected_fingering]
+        }
+    vented_d6 = next(row for row in rows if row["Degree"] == "Vented_Root_2")
+    vented_d7 = next(row for row in rows if row["Degree"] == "Vented_Root_3")
+    assert vented_d6["Register"] == 2
+    assert vented_d6["Target (Hz)"] == pytest.approx(targets["Octave_Degree_1"])
+    assert vented_d7["Register"] == 3
+    assert vented_d7["Target (Hz)"] == pytest.approx(2 * targets["Octave_Degree_1"])
+    for row in (vented_d6, vented_d7):
+        assert [row[label] for label in ACTIVE_HOLE_LABELS] == [
+            "o", "x", "x", "x", "x", "x"
+        ]
     assert all(row["Status"] == "OK" for row in rows)
 
 
 def test_missing_resonance_is_not_reported_as_a_frequency(layout, monkeypatch):
     monkeypatch.setattr(
         "tin_whistle_openwind.reporting.OpenWInDToneholeModel.impedance",
-        lambda model, frequencies, note: np.ones_like(frequencies, dtype=complex),
+        lambda model, frequencies, note, fingerings=None: np.ones_like(
+            frequencies, dtype=complex
+        ),
     )
     rows = fingering_tuning_rows(
         SUPPORTED_KEYS["Soprano_D"],
@@ -76,7 +104,9 @@ def test_missing_resonance_is_not_reported_as_a_frequency(layout, monkeypatch):
 def test_invalid_impedance_raises_instead_of_showing_a_successful_report(layout, monkeypatch):
     monkeypatch.setattr(
         "tin_whistle_openwind.reporting.OpenWInDToneholeModel.impedance",
-        lambda model, frequencies, note: np.full_like(frequencies, np.nan, dtype=complex),
+        lambda model, frequencies, note, fingerings=None: np.full_like(
+            frequencies, np.nan, dtype=complex
+        ),
     )
     with pytest.raises(RuntimeError, match="Invalid impedance"):
         fingering_tuning_rows(

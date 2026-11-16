@@ -43,12 +43,12 @@ def fingering_tuning_rows(
     mouthpiece: MouthpieceGeometry,
     temperature: float = 20.0,
 ) -> list[dict[str, str | float | int | None]]:
-    """Evaluate actual admittance peaks in both registers, including the fork.
+    """Evaluate two registers, alternate upper fork fingerings and the vented third-register root.
 
     The upper root uses the existing vented fingering; the other upper-register
     notes use the corresponding lower-register fingering at twice the target.
-    No third-octave root is added. Missing peaks are reported, not substituted
-    with a sweep endpoint.
+    The vented root is also evaluated one octave above that. Missing peaks are
+    reported, not substituted with a sweep endpoint.
     """
     instrument = WhistleGeometryFactory(temperature=temperature).create_tapered_instrument(
         mouthpiece, bore
@@ -61,43 +61,77 @@ def fingering_tuning_rows(
     )
     targets = generate_key_frequencies(key_config, tuning)
     rows: list[dict[str, str | float | int | None]] = []
-    for register in (1, 2):
+    for register in (1, 2, 3):
         for degree, base_target in targets.items():
             if degree == "Octave_Degree_1":
                 continue
-            fingering_name = (
-                "Octave_Degree_1" if register == 2 and degree == "Degree_1" else degree
-            )
-            target = (
-                targets["Octave_Degree_1"]
-                if register == 2 and degree == "Degree_1" else base_target * register
-            )
-            frequencies = np.linspace(0.8 * target, 1.2 * target, 801)
-            impedance = model.impedance(frequencies, fingering_name)
-            magnitude = np.abs(impedance)
-            if not np.all(np.isfinite(magnitude)) or np.any(magnitude <= 0):
-                raise RuntimeError(f"Invalid impedance for {degree}, register {register}.")
-            peaks, _ = find_peaks(1.0 / magnitude)
-            frequency = (
-                find_play_resonance(impedance, frequencies, target) if len(peaks) else None
-            )
-            rows.append(
-                {
-                    "Register": register,
-                    "Degree": degree,
-                    **{
-                        hole.label: "x" if closed else "o"
-                        for hole, closed in zip(
-                            layout.holes, STANDARD_FINGERINGS[fingering_name]
-                        )
-                    },
-                    "Target (Hz)": float(target),
-                    "Simulated (Hz)": frequency,
-                    "Deviation (cents)": (
-                        float(1200.0 * np.log2(frequency / target))
-                        if frequency is not None else None
-                    ),
-                    "Status": "OK" if frequency is not None else "No resonance in search window",
-                }
-            )
+            if register == 3:
+                if degree != "Degree_1":
+                    continue
+                fingering_name = "Octave_Degree_1"
+                target = targets["Octave_Degree_1"] * 2
+                reported_degree = "Vented_Root_3"
+            else:
+                fingering_name = (
+                    "Octave_Degree_1" if register == 2 and degree == "Degree_1" else degree
+                )
+                target = (
+                    targets["Octave_Degree_1"]
+                    if register == 2 and degree == "Degree_1" else base_target * register
+                )
+                reported_degree = (
+                    "Vented_Root_2" if register == 2 and degree == "Degree_1" else degree
+                )
+            fingering_options: list[tuple[str, str, list[int] | None]] = [
+                (reported_degree, fingering_name, None)
+            ]
+            if register == 2 and degree == "Fork_Minor7":
+                fingering_options.extend(
+                    [
+                        ("Fork_Minor7_Alt1", "Fork_Minor7_Alt1", [0, 1, 1, 1, 0, 0]),
+                        ("Fork_Minor7_Alt2", "Fork_Minor7_Alt2", [0, 1, 1, 1, 0, 1]),
+                    ]
+                )
+            for option_degree, option_fingering, custom_pattern in fingering_options:
+                frequencies = np.linspace(0.8 * target, 1.2 * target, 801)
+                impedance = (
+                    model.impedance(frequencies, option_fingering)
+                    if custom_pattern is None else
+                    model.impedance(
+                        frequencies,
+                        option_fingering,
+                        {option_fingering: custom_pattern},
+                    )
+                )
+                magnitude = np.abs(impedance)
+                if not np.all(np.isfinite(magnitude)) or np.any(magnitude <= 0):
+                    raise RuntimeError(
+                        f"Invalid impedance for {option_degree}, register {register}."
+                    )
+                peaks, _ = find_peaks(1.0 / magnitude)
+                frequency = (
+                    find_play_resonance(impedance, frequencies, target) if len(peaks) else None
+                )
+                rows.append(
+                    {
+                        "Register": register,
+                        "Degree": option_degree,
+                        **{
+                            hole.label: "x" if closed else "o"
+                            for hole, closed in zip(
+                                layout.holes,
+                                custom_pattern or STANDARD_FINGERINGS[option_fingering],
+                            )
+                        },
+                        "Target (Hz)": float(target),
+                        "Simulated (Hz)": frequency,
+                        "Deviation (cents)": (
+                            float(1200.0 * np.log2(frequency / target))
+                            if frequency is not None else None
+                        ),
+                        "Status": (
+                            "OK" if frequency is not None else "No resonance in search window"
+                        ),
+                    }
+                )
     return rows
