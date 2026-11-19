@@ -6,6 +6,13 @@ from .geometry import (
 	WhistleGeometryFactory,
 	WhistleInstrument,
 )
+from .genetic_optimizer import (
+	GeneticAlgorithmConfig,
+	GeneticGeometryOptimizer,
+	GeneticOptimizationResult,
+	GeometryDNA,
+	optimize_geometry_genetically,
+)
 from .keys import SUPPORTED_KEYS, WhistleKeyConfig
 from .pipeline import FinalWhistleDesign, WhistleDesignPipeline
 from .optimizer import InverseToneholeOptimizationResult, InverseToneholeOptimizer
@@ -19,6 +26,10 @@ from .tuning import (
 __all__ = [
 	"EQUAL_TEMPERAMENT",
 	"FinalWhistleDesign",
+	"GeneticAlgorithmConfig",
+	"GeneticGeometryOptimizer",
+	"GeneticOptimizationResult",
+	"GeometryDNA",
 	"IRISH_FOLK_HYBRID",
 	"InverseToneholeOptimizationResult",
 	"InverseToneholeOptimizer",
@@ -33,4 +44,5 @@ __all__ = [
 	"WhistleGeometryFactory",
 	"WhistleInstrument",
 	"WhistleKeyConfig",
+	"optimize_geometry_genetically",
 ]

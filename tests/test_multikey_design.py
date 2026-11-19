@@ -203,21 +203,39 @@ def test_pipeline_uses_requested_mouthpiece_through_all_stages(monkeypatch):
         optimized_mouthpieces.append(mouthpiece)
         return SimpleNamespace(layout=layout, bore=bore)
 
+    def fake_optimize_genetically(
+        key_config, optimized_bore, optimized_layout, temperament, **kwargs
+    ):
+        return SimpleNamespace(
+            bore=optimized_bore,
+            layout=optimized_layout,
+            dna=SimpleNamespace(endhole_radius_m=0.0071),
+        )
+
+    bevels = []
     monkeypatch.setattr(pipeline_module, "optimize_length_endhole", fake_optimize_length_endhole)
     monkeypatch.setattr(pipeline_module, "optimize_toneholes", fake_optimize_toneholes)
     monkeypatch.setattr(
+        pipeline_module, "optimize_geometry_genetically", fake_optimize_genetically
+    )
+    monkeypatch.setattr(
         pipeline_module,
         "optimize_undercut",
-        lambda optimized_layout: SimpleNamespace(layout=optimized_layout),
+        lambda optimized_layout, bevel_deg=0.0: (
+            bevels.append(bevel_deg) or SimpleNamespace(layout=optimized_layout)
+        ),
     )
 
     pipeline.run_stage_1_length_endhole_optimization()
     pipeline.run_stage_2_tonehole_optimization(bore)
+    pipeline.run_genetic_refinement(bore, layout)
     design = pipeline.run_stage_3_undercut_optimization(bore, layout)
 
     assert optimized_mouthpieces == [
         (pipeline.mouthpiece, False),
         pipeline.mouthpiece,
     ]
+    assert bevels == []
+    assert design.holes is layout
     assert design.metadata["mouthpiece_name"] == "MouthpieceDN16V4"
-    assert design.metadata["endhole_optimized"] is False
+    assert design.metadata["endhole_optimized"] is True

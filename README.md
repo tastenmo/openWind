@@ -18,7 +18,7 @@ Open `notebooks/01_geometry_and_fingering.ipynb` first. Replace the placeholder 
 
 - `src/tin_whistle_openwind/`: reusable geometry, fingering, acoustics, optimization, and undercutting code
 - `data/`: design inputs and target frequencies
-- `notebooks/`: staged experiments
+- `notebooks/`: staged experiments, including `genetic_geometry_optimization.ipynb` for defining, running, and analyzing the geometry GA
 - `artifacts/`: generated figures and tables
 - `tests/`: focused regression tests
 
@@ -46,6 +46,60 @@ Its acoustic simulation includes the
 same mouthpiece geometry and offsets hole positions into the combined instrument
 coordinate system. After Stage 2, use `pipeline.tonehole_result.bore` for tables,
 simulation and Stage 3/export, rather than the provisional Stage 1 bore.
+
+An optional genetic refinement can search the Stage 2 design jointly. Its
+20-gene geometry DNA contains pipe length, six tonehole positions, six bore
+radii evaluated at those moving hole positions, six hole diameters, and one
+shared chimney bevel angle. The bore radii are limited to a configurable
+fraction around the seed profile (5% by default); the decoded profile
+interpolates those local radius changes through the seed bore while retaining
+its start and end treatment. The search also respects the existing ±5% pipe
+length range, 5–8 mm hole diameters, within-hand spacing, hole order,
+30 mm bottom-hole clearance, and 0–15° bevel bounds.
+
+```python
+from tin_whistle_openwind import GeneticAlgorithmConfig, WhistleDesignPipeline
+
+pipeline = WhistleDesignPipeline("Soprano_D", optimize_endhole=False)
+bore = pipeline.run_stage_1_length_endhole_optimization()
+holes = pipeline.run_stage_2_tonehole_optimization(bore)
+seed_bore = pipeline.tonehole_result.bore
+result = pipeline.run_genetic_refinement(
+    seed_bore,
+    holes,
+    config=GeneticAlgorithmConfig(
+        population_size=20,
+        generations=10,
+        random_seed=42,
+        include_second_register=True,
+        optimize_endhole=True,
+        optimize_bevel=False,
+    ),
+)
+design = pipeline.run_stage_3_undercut_optimization(result.bore, result.layout)
+```
+
+This example starts with a cylindrical seed and lets the GA vary the six
+hole positions, diameters, local bore radii, and the endhole radius in one
+search. With `notes=None`, the GA scores eight lower-register targets
+(including the fork) and seven upper-register targets (no forks).
+The upper notes use their standard fingerings at twice the lower
+target, except for the root, which uses the vented fingering. The endhole
+radius uses the same relative bound as the other bore radii, and the GA
+adds a 20 mm terminal taper when the seed is cylindrical. Bevel remains
+unchanged. See the [executed notebook](notebooks/genetic_geometry_optimization.ipynb)
+for the before-and-after tuning by register.
+
+The NumPy-based genetic search is opt-in and does not change the existing
+staged optimizers. When `Degree_1` is selected, it retunes each candidate's
+pipe length within the existing geometry limits before scoring the other
+notes. Candidates meeting the 0.1-cent closed-root tolerance rank ahead of
+those that miss it; if none meets it, the result reports the closest root
+and marks the tolerance as unmet. Use `retune_closed_root=False` to compare
+against the original penalty-based search. The result reports the best
+geometry, before/after tuning errors and costs, and the number of unique
+candidates scored (not the number of acoustic sweeps). A fixed `random_seed`
+makes the evolutionary operations reproducible.
 
 The 18 mm minimum tonehole spacing applies within each hand only (L1-L2,
 L2-L3, R1-R2, R2-R3), including measured-impedance inversion. There is no

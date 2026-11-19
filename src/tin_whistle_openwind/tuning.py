@@ -72,6 +72,12 @@ STANDARD_FINGERINGS: dict[str, list[int]] = {
     "Octave_Degree_1": [0, 1, 1, 1, 1, 1],  # vented octave fingering (hole 1 open, all others closed)
 }
 
+# Upper-register GA targets omit the fork; the lower-register fork is retained.
+SECOND_REGISTER_FINGERINGS = {
+    f"Octave_{degree}": "Octave_Degree_1" if degree == "Degree_1" else degree
+    for degree in DEGREE_LABELS if degree not in {"Octave_Degree_1", "Fork_Minor7"}
+}
+
 
 def generate_key_frequencies(
     key_config: WhistleKeyConfig,

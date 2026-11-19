@@ -9,7 +9,7 @@
         0.0070999999999999995
       ],
       [
-        0.24115815871667617,
+        0.2411581587165985,
         0.0070999999999999995
       ]
     ]
@@ -17,42 +17,42 @@
   "holes": [
     {
       "label": "L1",
-      "position_m": 0.0991220973778799,
-      "diameter_m": 0.007371852398919964,
+      "position_m": 0.09912209737795546,
+      "diameter_m": 0.007371852398597566,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     },
     {
       "label": "L2",
-      "position_m": 0.11722209737787989,
-      "diameter_m": 0.007411032848974513,
+      "position_m": 0.11722209737795547,
+      "diameter_m": 0.007411032848976287,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     },
     {
       "label": "L3",
-      "position_m": 0.1353220973778799,
-      "diameter_m": 0.007099600039080669,
+      "position_m": 0.13532209737795545,
+      "diameter_m": 0.007099600039579387,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     },
     {
       "label": "R1",
-      "position_m": 0.15546660900780543,
-      "diameter_m": 0.005240075300448012,
+      "position_m": 0.15546660901198578,
+      "diameter_m": 0.005240075302001745,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     },
     {
       "label": "R2",
-      "position_m": 0.17356660900780543,
+      "position_m": 0.17356660901198578,
       "diameter_m": 0.008,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0
     },
     {
       "label": "R3",
-      "position_m": 0.19854927888529667,
+      "position_m": 0.19854927888404184,
       "diameter_m": 0.007999999999999998,
       "chimney_height_m": 0.003,
       "bevel_deg": 0.0

@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from .geometry import PipeGeometry, TaperedBoreGeometry, UndercutTonehole, WhistleGeometryFactory
+from .genetic_optimizer import (
+    GeneticAlgorithmConfig,
+    GeneticOptimizationResult,
+    optimize_geometry_genetically,
+)
 from .keys import SUPPORTED_KEYS, WhistleKeyConfig, inner_radius_m, pipe_length_m, scale_mouthpiece_length_m
 from .optimize_bore import LengthEndholeOptimizationResult, optimize_length_endhole
 from .optimize_toneholes import optimize_toneholes
@@ -66,6 +71,7 @@ class WhistleDesignPipeline:
         self.bore_result: LengthEndholeOptimizationResult | None = None
         self.tonehole_result: ToneholeOptimizationResult | None = None
         self.undercut_result: UndercutOptimizationResult | None = None
+        self.genetic_result: GeneticOptimizationResult | None = None
 
     def run_stage_1_length_endhole_optimization(
         self, starting_bore_radius_m: float | None = None
@@ -88,8 +94,31 @@ class WhistleDesignPipeline:
         )
         return self.tonehole_result.layout
 
+    def run_genetic_refinement(
+        self,
+        bore: TaperedBoreGeometry,
+        holes: ToneholeLayout,
+        config: GeneticAlgorithmConfig | None = None,
+        notes: Sequence[str] | None = None,
+    ) -> GeneticOptimizationResult:
+        """Refine a bore/layout candidate with the opt-in genetic optimizer."""
+        self.genetic_result = optimize_geometry_genetically(
+            self.key_config,
+            bore,
+            holes,
+            self.temperament,
+            temperature=self.geometry_factory.temperature,
+            mouthpiece=self.mouthpiece,
+            config=config,
+            notes=notes,
+        )
+        return self.genetic_result
+
     def run_stage_3_undercut_optimization(
-        self, bore: TaperedBoreGeometry, holes: ToneholeLayout
+        self,
+        bore: TaperedBoreGeometry,
+        holes: ToneholeLayout,
+        bevel_deg: float | None = None,
     ) -> FinalWhistleDesign:
         if (
             self.tonehole_result is not None
@@ -97,7 +126,21 @@ class WhistleDesignPipeline:
             and bore != self.tonehole_result.bore
         ):
             raise ValueError("Use tonehole_result.bore after Stage 2, not the Stage 1 bore.")
-        self.undercut_result = optimize_undercut(holes)
+        if (
+            self.genetic_result is not None
+            and holes is self.genetic_result.layout
+            and bore != self.genetic_result.bore
+        ):
+            raise ValueError("Use genetic_result.bore when finalizing the genetic layout.")
+        genetic_result = self.genetic_result if (
+            self.genetic_result is not None and holes is self.genetic_result.layout
+        ) else None
+        if genetic_result is not None and bevel_deg is None:
+            self.undercut_result = UndercutOptimizationResult(holes)
+        else:
+            self.undercut_result = optimize_undercut(
+                holes, bevel_deg=0.0 if bevel_deg is None else bevel_deg
+            )
         return FinalWhistleDesign(
             key_name=self.key_config.name,
             temperament_name=self.temperament.name,
@@ -107,6 +150,9 @@ class WhistleDesignPipeline:
             metadata={
                 "root_note": self.key_config.root_note,
                 "mouthpiece_name": self.mouthpiece.name,
-                "endhole_optimized": self.optimize_endhole,
+                "endhole_optimized": self.optimize_endhole or (
+                    genetic_result is not None
+                    and genetic_result.dna.endhole_radius_m is not None
+                ),
             },
         )
