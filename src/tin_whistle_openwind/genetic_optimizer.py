@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Sequence
+import os
+import sys
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import ExitStack
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Callable, Sequence
 
 import numpy as np
 from scipy.optimize import brentq
@@ -11,6 +16,7 @@ from scipy.signal import find_peaks
 
 from .geometry import (
     DEFAULT_TEMPERATURE,
+    DEFAULT_DATA_DIR,
     MouthpieceGeometry,
     TaperedBoreGeometry,
     UndercutTonehole,
@@ -28,6 +34,8 @@ from .optimizer import (
     OpenWInDToneholeModel,
     ToneholeLayout,
 )
+from .resonances import resonance_peak_rows
+from .genetic_winners import WinnerArchive
 from .tuning import (
     DEGREE_LABELS,
     SECOND_REGISTER_FINGERINGS,
@@ -36,11 +44,64 @@ from .tuning import (
 )
 
 MISSING_UPPER_RESONANCE_COST_CENTS = 1200.0
+GEOMETRY_RESOLUTION_M = 1e-4
+ROOT_ERROR_WEIGHT = 10.0
+
+
+def _normalized_note_weights(
+    notes: Sequence[str], root_weight: float,
+) -> dict[str, float]:
+    if not notes:
+        raise ValueError("At least one note is required.")
+    register_weights = {"Degree_1": 0.6, "Octave_Degree_1": 0.4}
+    roots = {
+        note: "Octave_Degree_1" if note in SECOND_REGISTER_FINGERINGS else "Degree_1"
+        for note in notes
+    }
+    note_weights = {
+        note: root_weight if note == roots[note] else 1.0
+        for note in notes
+    }
+    totals = {
+        root: sum(note_weights[note] for note in notes if roots[note] == root)
+        for root in set(roots.values())
+    }
+    register_total = sum(register_weights[root] for root in totals)
+    return {
+        note: float(
+            register_weights[roots[note]] / register_total
+            * note_weights[note] / totals[roots[note]]
+        )
+        for note in notes
+    }
+
+
+def normalized_pitch_costs(errors: dict[str, float]) -> dict[str, float]:
+    """Per-note weighted mean squared costs, with 60/40 registers and 10x roots."""
+    weights = _normalized_note_weights(list(errors), ROOT_ERROR_WEIGHT)
+    return {note: float(weights[note] * error ** 2) for note, error in errors.items()}
+
+
+def normalized_q_rewards(
+    q_factors: dict[str, float | None], *, weight: float = 1.0, scale: float = 40.0,
+) -> dict[str, float]:
+    """Bounded higher-Q rewards, with equal notes within 60/40 registers."""
+    if not np.isfinite(weight) or weight < 0 or not np.isfinite(scale) or scale <= 0:
+        raise ValueError("Q reward weight must be nonnegative and scale must be positive.")
+    weights = _normalized_note_weights(list(q_factors), 1.0)
+    rewards = {}
+    for note, q in q_factors.items():
+        if q is not None and (not np.isfinite(q) or q <= 0):
+            raise ValueError("Resolved Q must be finite and positive.")
+        rewards[note] = 0.0 if q is None else float(
+            weight * weights[note] * (1.0 / (1.0 + scale / q))
+        )
+    return rewards
 
 
 @dataclass(frozen=True)
 class GeneticAlgorithmConfig:
-    """Controls for the continuous, real-valued genetic search."""
+    """Controls for the search; bore-radius fraction caps each downward hole step."""
 
     population_size: int = 20
     generations: int = 10
@@ -48,12 +109,20 @@ class GeneticAlgorithmConfig:
     crossover_rate: float = 0.8
     mutation_rate: float = 0.15
     mutation_scale: float = 0.08
-    bore_radius_variation_fraction: float = 0.05
+    bore_radius_variation_fraction: float = 0.20
     random_seed: int | None = None
     retune_closed_root: bool = True
     include_second_register: bool = False
     optimize_endhole: bool = False
     optimize_bevel: bool = True
+    independent_hole_geometry: bool = False
+    max_outer_diameter_m: float = 0.016
+    minimum_wall_m: float = 0.0009
+    q_reward_weight: float = 0.0
+    q_reward_scale: float = 40.0
+    root_relative_q: bool = False
+    workers: int | None = None
+    winner_directory: Path | str | None = DEFAULT_DATA_DIR / "ga-winners"
 
     def __post_init__(self) -> None:
         if not isinstance(self.population_size, int) or isinstance(self.population_size, bool):
@@ -86,11 +155,37 @@ class GeneticAlgorithmConfig:
             or self.random_seed < 0
         ):
             raise ValueError("random_seed must be a nonnegative integer or None.")
+        if self.root_relative_q and self.retune_closed_root:
+            raise ValueError("root_relative_q requires retune_closed_root=False.")
+        for name, value in (
+            ("max_outer_diameter_m", self.max_outer_diameter_m),
+            ("minimum_wall_m", self.minimum_wall_m),
+            ("q_reward_scale", self.q_reward_scale),
+        ):
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive.")
+        if self.minimum_wall_m >= self.max_outer_diameter_m / 2:
+            raise ValueError("minimum_wall_m must be smaller than the outer radius.")
+        if not np.isfinite(self.q_reward_weight) or self.q_reward_weight < 0:
+            raise ValueError("q_reward_weight must be finite and nonnegative.")
+        if self.q_reward_weight and not self.root_relative_q:
+            raise ValueError("Q rewards require root_relative_q=True.")
+        if self.workers is not None and (
+            not isinstance(self.workers, int)
+            or isinstance(self.workers, bool)
+            or self.workers < 1
+        ):
+            raise ValueError("workers must be a positive integer or None.")
+        if self.winner_directory is not None and (
+            not isinstance(self.winner_directory, (str, Path))
+            or not str(self.winner_directory).strip()
+        ):
+            raise ValueError("winner_directory must be a directory path or None.")
 
 
 @dataclass
 class GeometryDNA:
-    """Real-valued genes for pipe length, six holes, their bore radii, and bevel."""
+    """Legacy 20/21 genes, or 31/32 genes with independent heights and bevels."""
 
     pipe_length_m: float
     hole_positions_m: np.ndarray
@@ -98,15 +193,27 @@ class GeometryDNA:
     hole_diameters_m: np.ndarray
     bevel_deg: float
     endhole_radius_m: float | None = None
+    chimney_heights_m: np.ndarray | None = None
+    hole_bevels_deg: np.ndarray | None = None
 
     def to_vector(self) -> np.ndarray:
+        if (self.chimney_heights_m is None) != (self.hole_bevels_deg is None):
+            raise ValueError("Independent chimney heights and bevels must be supplied together.")
+        if self.chimney_heights_m is not None:
+            if self.hole_bevels_deg is None:
+                raise ValueError("Independent hole bevels are required with chimney heights.")
+            if self.chimney_heights_m.shape != (6,) or self.hole_bevels_deg.shape != (6,):
+                raise ValueError("Independent hole arrays must each contain six values.")
+            hole_genes = np.r_[self.chimney_heights_m, self.hole_bevels_deg]
+        else:
+            hole_genes = np.asarray([self.bevel_deg])
         return np.concatenate(
             (
                 np.asarray([self.pipe_length_m]),
                 np.asarray(self.hole_positions_m, dtype=float),
                 np.asarray(self.bore_radii_at_holes_m, dtype=float),
                 np.asarray(self.hole_diameters_m, dtype=float),
-                np.asarray([self.bevel_deg]),
+                hole_genes,
                 np.asarray([] if self.endhole_radius_m is None else [self.endhole_radius_m]),
             )
         )
@@ -114,16 +221,35 @@ class GeometryDNA:
     @classmethod
     def from_vector(cls, vector: np.ndarray) -> "GeometryDNA":
         vector = np.asarray(vector, dtype=float)
-        if vector.shape not in ((20,), (21,)):
-            raise ValueError("A geometry genome must contain 20 genes, or 21 with the endhole.")
+        if vector.shape not in ((20,), (21,), (31,), (32,)):
+            raise ValueError(
+                "A geometry genome must contain 20 genes, or 21 with the endhole, "
+                "or 31/32 genes with independent holes."
+            )
+        independent = len(vector) in (31, 32)
+        end_index = 31 if independent else 20
         return cls(
             pipe_length_m=float(vector[0]),
             hole_positions_m=vector[1:7].copy(),
             bore_radii_at_holes_m=vector[7:13].copy(),
             hole_diameters_m=vector[13:19].copy(),
-            bevel_deg=float(vector[19]),
-            endhole_radius_m=float(vector[20]) if len(vector) == 21 else None,
+            bevel_deg=float(np.mean(vector[25:31])) if independent else float(vector[19]),
+            endhole_radius_m=float(vector[end_index]) if len(vector) == end_index + 1 else None,
+            chimney_heights_m=vector[19:25].copy() if independent else None,
+            hole_bevels_deg=vector[25:31].copy() if independent else None,
         )
+
+    @property
+    def dimensional_values(self) -> np.ndarray:
+        values = np.r_[
+            self.pipe_length_m, self.hole_positions_m,
+            self.bore_radii_at_holes_m, self.hole_diameters_m,
+        ]
+        if self.chimney_heights_m is not None:
+            values = np.r_[values, self.chimney_heights_m]
+        if self.endhole_radius_m is not None:
+            values = np.r_[values, self.endhole_radius_m]
+        return values
 
 
 @dataclass
@@ -142,6 +268,14 @@ class GeneticOptimizationResult:
     evaluations: int
     root_tuning_satisfied: bool | None
     initial_cent_errors: dict[str, float] = field(default_factory=dict)
+    relative_cent_errors: dict[str, float] = field(default_factory=dict)
+    initial_relative_cent_errors: dict[str, float] = field(default_factory=dict)
+    q_factors: dict[str, float | None] = field(default_factory=dict)
+    initial_q_factors: dict[str, float | None] = field(default_factory=dict)
+    initial_pitch_cost: float | None = None
+    final_pitch_cost: float | None = None
+    initial_q_reward: float = 0.0
+    final_q_reward: float = 0.0
 
     @property
     def improved(self) -> bool:
@@ -155,14 +289,47 @@ class _CandidateScore:
     cost: float
     fitness: float
     root_violation: float
+    relative_errors: dict[str, float] = field(default_factory=dict)
+    q_factors: dict[str, float | None] = field(default_factory=dict)
+    pitch_cost: float | None = None
+    q_reward: float = 0.0
 
     @property
     def rank(self) -> tuple[float, float]:
         return self.root_violation, self.cost if self.root_violation else self.fitness
 
 
+_worker_optimizer: GeneticGeometryOptimizer | None = None
+
+
+def _initialize_worker(
+    key_config: WhistleKeyConfig,
+    tuning: TuningProfile,
+    bore: TaperedBoreGeometry,
+    layout: ToneholeLayout,
+    temperature: float,
+    mouthpiece: MouthpieceGeometry | None,
+    config: GeneticAlgorithmConfig,
+) -> None:
+    global _worker_optimizer
+    _worker_optimizer = GeneticGeometryOptimizer(
+        key_config, tuning, bore, layout, temperature, mouthpiece, config
+    )
+
+
+def _score_in_worker(
+    task: tuple[np.ndarray, tuple[str, ...]],
+) -> _CandidateScore:
+    if _worker_optimizer is None:
+        raise RuntimeError("Genetic optimization worker is not initialized.")
+    vector, notes = task
+    return _worker_optimizer._score(
+        vector, notes, retune=_worker_optimizer.config.retune_closed_root
+    )
+
+
 class _GeometryGenomeCodec:
-    """Encode and decode valid geometry while constraining candidate variation."""
+    """Encode geometry with 0.1 mm resolution and cascading bore-radius bounds."""
 
     def __init__(
         self,
@@ -195,6 +362,13 @@ class _GeometryGenomeCodec:
             raise ValueError("A six-hole seed layout is required.")
         if tuple(hole.label for hole in self.seed_layout.holes) != ACTIVE_HOLE_LABELS:
             raise ValueError("Seed holes must be labeled and ordered from L1 to R3.")
+        if self.config.independent_hole_geometry:
+            maximum_bore = self.config.max_outer_diameter_m / 2 - self.config.minimum_wall_m
+            fixed_radii = [points[0, 1]]
+            if not self.config.optimize_endhole:
+                fixed_radii.append(points[-1, 1])
+            if max(fixed_radii) > maximum_bore + 1e-12:
+                raise ValueError("Fixed bore exceeds the outer diameter/minimum wall envelope.")
 
     def _resized_seed(self, length_m: float) -> TaperedBoreGeometry:
         return self.seed_bore.with_length(length_m)
@@ -209,6 +383,26 @@ class _GeometryGenomeCodec:
     def _position_gaps(self) -> np.ndarray:
         return np.asarray(MIN_ADJACENT_HOLE_SPACINGS_M, dtype=float) + 1e-4
 
+    @staticmethod
+    def _grid_units(value_m: float, *, ceil: bool = False, floor: bool = False) -> int:
+        units = value_m / GEOMETRY_RESOLUTION_M
+        if ceil:
+            return int(np.ceil(units - 1e-9))
+        if floor:
+            return int(np.floor(units + 1e-9))
+        return int(np.rint(units))
+
+    @classmethod
+    def _quantize_bounded(cls, value_m: float, lower_m: float, upper_m: float) -> float:
+        lower_units = cls._grid_units(lower_m, ceil=True)
+        upper_units = cls._grid_units(upper_m, floor=True)
+        if lower_units > upper_units:
+            raise ValueError(
+                "The requested geometric bounds contain no 0.1 mm resolution value."
+            )
+        units = int(np.clip(cls._grid_units(value_m), lower_units, upper_units))
+        return units * GEOMETRY_RESOLUTION_M
+
     def _minimum_length_for_bottom_hole(self, position_m: float) -> float:
         terminal_length = (
             self.seed_bore.length_m - self.seed_bore.segments[-2][0]
@@ -221,57 +415,120 @@ class _GeometryGenomeCodec:
         if not np.all(np.isfinite(vector)):
             raise ValueError("Genome genes must all be finite.")
         dna = GeometryDNA.from_vector(vector)
-        length_m = float(
-            np.clip(
-                dna.pipe_length_m,
-                0.95 * self.seed_bore.length_m,
-                1.05 * self.seed_bore.length_m,
-            )
+        if (dna.chimney_heights_m is not None) != self.config.independent_hole_geometry:
+            raise ValueError("Genome schema does not match independent_hole_geometry.")
+        length_m = self._quantize_bounded(
+            dna.pipe_length_m,
+            0.95 * self.seed_bore.length_m,
+            1.05 * self.seed_bore.length_m,
         )
 
-        gaps = self._position_gaps()
-        offsets = np.r_[0.0, np.cumsum(gaps)]
-        first_position_min = 0.018
-        last_position_max = length_m - MIN_BOTTOM_END_DISTANCE_M - 1e-4
+        gap_units = np.ceil(
+            self._position_gaps() / GEOMETRY_RESOLUTION_M - 1e-9
+        ).astype(int)
+        offsets = np.r_[0, np.cumsum(gap_units)]
+        first_position_min = self._grid_units(0.018, ceil=True)
+        last_position_max = self._grid_units(
+            length_m - MIN_BOTTOM_END_DISTANCE_M - 1e-4, floor=True
+        )
         resized_seed = self._resized_seed(length_m)
         if len(resized_seed.segments) > 2:
             last_position_max = min(
                 last_position_max,
-                resized_seed.segments[-2][0] - 1e-4,
+                self._grid_units(resized_seed.segments[-2][0] - 1e-4, floor=True),
             )
         last_transformed_max = last_position_max - offsets[-1]
         if last_transformed_max < first_position_min:
             raise ValueError("Pipe is too short to fit the six-hole spacing constraints.")
-        transformed = np.asarray(dna.hole_positions_m, dtype=float) - offsets
-        transformed = np.clip(
-            transformed, first_position_min, last_transformed_max
-        )
+        transformed = np.rint(dna.hole_positions_m / GEOMETRY_RESOLUTION_M) - offsets
+        transformed = np.clip(transformed, first_position_min, last_transformed_max)
         transformed = np.maximum.accumulate(transformed)
-        positions = transformed + offsets
+        positions = (transformed + offsets) * GEOMETRY_RESOLUTION_M
 
         seed_radii = self._seed_radii_at(positions, length_m)
         radius_fraction = self.config.bore_radius_variation_fraction
-        radii = np.clip(
-            dna.bore_radii_at_holes_m,
-            seed_radii * (1.0 - radius_fraction),
-            seed_radii * (1.0 + radius_fraction),
+        radii = np.empty(len(seed_radii), dtype=float)
+        previous_radius = (
+            self._grid_units(
+                min(seed_radii[0], self.seed_bore.segments[0][1]), floor=True
+            )
+            * GEOMETRY_RESOLUTION_M
         )
-        diameters = np.clip(
-            dna.hole_diameters_m, MIN_HOLE_DIAMETER_M, MAX_HOLE_DIAMETER_M
+        if self.config.independent_hole_geometry:
+            previous_radius = min(
+                previous_radius,
+                self._grid_units(
+                    self.config.max_outer_diameter_m / 2 - self.config.minimum_wall_m,
+                    floor=True,
+                ) * GEOMETRY_RESOLUTION_M,
+            )
+        fixed_end_radius = (
+            0.0 if self.config.optimize_endhole else self.seed_bore.segments[-1][1]
+        )
+        for index, proposed_radius in enumerate(dna.bore_radii_at_holes_m):
+            radii[index] = self._quantize_bounded(
+                proposed_radius,
+                max(
+                    previous_radius * (1.0 - radius_fraction), fixed_end_radius,
+                    MIN_HOLE_DIAMETER_M / 2 if self.config.independent_hole_geometry else 0,
+                ),
+                previous_radius,
+            )
+            previous_radius = radii[index]
+        diameters = np.asarray(
+            [
+                self._quantize_bounded(
+                    diameter, MIN_HOLE_DIAMETER_M,
+                    min(MAX_HOLE_DIAMETER_M, 2 * radii[index])
+                    if self.config.independent_hole_geometry else MAX_HOLE_DIAMETER_M,
+                )
+                for index, diameter in enumerate(dna.hole_diameters_m)
+            ],
+            dtype=float,
         )
         bevel_deg = float(np.clip(dna.bevel_deg, 0.0, 15.0))
         if not self.config.optimize_bevel:
             bevel_deg = self._seed_bevel()
+        heights = bevels = None
+        if self.config.independent_hole_geometry:
+            if dna.chimney_heights_m is None or dna.hole_bevels_deg is None:
+                raise ValueError("Independent hole genomes require six heights and bevels.")
+            heights = np.asarray([
+                self._quantize_bounded(
+                    height, self.config.minimum_wall_m,
+                    self.config.max_outer_diameter_m / 2 - radius,
+                )
+                for height, radius in zip(dna.chimney_heights_m, radii)
+            ])
+            bevels = np.asarray([
+                hole.bevel_deg if not self.config.optimize_bevel else float(np.clip(
+                    angle, 0.0, min(
+                        15.0,
+                        np.degrees(np.arctan(max(0.0, radius - diameter / 2) / height)),
+                    ),
+                ))
+                for hole, angle, radius, diameter, height in zip(
+                    self.seed_layout.holes, dna.hole_bevels_deg, radii, diameters, heights
+                )
+            ])
+            for index, hole in enumerate(self.seed_layout.holes):
+                if not self.config.optimize_bevel and hole.bevel_side == "bore":
+                    inner = diameters[index] / 2 + heights[index] * np.tan(np.radians(bevels[index]))
+                    if inner > radii[index] + 1e-12:
+                        raise ValueError("Fixed bore-side bevel does not fit the local bore.")
         endhole_radius = None
         if self.config.optimize_endhole:
-            seed_radius = self.seed_bore.segments[-1][1]
-            gene = seed_radius if dna.endhole_radius_m is None else dna.endhole_radius_m
-            endhole_radius = float(np.clip(
-                gene, seed_radius * (1.0 - radius_fraction),
-                seed_radius * (1.0 + radius_fraction),
-            ))
+            gene = (
+                self.seed_bore.segments[-1][1]
+                if dna.endhole_radius_m is None
+                else dna.endhole_radius_m
+            )
+            endhole_radius = self._quantize_bounded(
+                gene, radii[-1] * 0.70, radii[-1]
+            )
         repaired = GeometryDNA(
-            length_m, positions, radii, diameters, bevel_deg, endhole_radius
+            length_m, positions, radii, diameters, bevel_deg, endhole_radius,
+            chimney_heights_m=heights, hole_bevels_deg=bevels,
         ).to_vector()
         return repaired
 
@@ -285,38 +542,47 @@ class _GeometryGenomeCodec:
         diameters = self.seed_layout.diameters_m
         bevel = self._seed_bevel()
         return self.repair(
-            GeometryDNA(length_m, positions, radii, diameters, bevel).to_vector()
+            GeometryDNA(
+                length_m, positions, radii, diameters, bevel,
+                chimney_heights_m=np.asarray([
+                    hole.chimney_height_m for hole in self.seed_layout.holes
+                ]) if self.config.independent_hole_geometry else None,
+                hole_bevels_deg=np.asarray([
+                    hole.bevel_deg for hole in self.seed_layout.holes
+                ]) if self.config.independent_hole_geometry else None,
+            ).to_vector()
         )
 
     def decode(self, vector: np.ndarray) -> tuple[TaperedBoreGeometry, ToneholeLayout]:
         dna = GeometryDNA.from_vector(self.repair(vector))
         seed_profile = self._resized_seed(dna.pipe_length_m)
         seed_points = np.asarray(seed_profile.segments, dtype=float)
-        seed_radii = np.interp(dna.hole_positions_m, seed_points[:, 0], seed_points[:, 1])
-        radius_scales = dna.bore_radii_at_holes_m / seed_radii
         knot_positions = np.unique(
             np.concatenate((seed_points[:, 0], dna.hole_positions_m))
         )
-        base_radii = np.interp(knot_positions, seed_points[:, 0], seed_points[:, 1])
-        scale_positions = np.r_[0.0, dna.hole_positions_m, dna.pipe_length_m]
-        scale_values = np.r_[1.0, radius_scales, 1.0]
+        end_radius = (
+            dna.endhole_radius_m
+            if dna.endhole_radius_m is not None
+            else seed_points[-1, 1]
+        )
+        profile_positions = np.r_[0.0, dna.hole_positions_m, dna.pipe_length_m]
+        profile_radii = np.r_[seed_points[0, 1], dna.bore_radii_at_holes_m, end_radius]
         if len(seed_points) > 2 or dna.endhole_radius_m is not None:
             terminal_taper_start = (
                 seed_points[-2, 0] if len(seed_points) > 2 else dna.pipe_length_m - 0.020
             )
             knot_positions = np.union1d(knot_positions, [terminal_taper_start])
-            base_radii = np.interp(knot_positions, seed_points[:, 0], seed_points[:, 1])
-            scale_positions = np.r_[
+            profile_positions = np.r_[
                 0.0,
                 dna.hole_positions_m,
                 terminal_taper_start,
                 dna.pipe_length_m,
             ]
-            scale_values = np.r_[1.0, radius_scales, 1.0, 1.0]
-        knot_scales = np.interp(knot_positions, scale_positions, scale_values)
-        knot_radii = base_radii * knot_scales
-        if dna.endhole_radius_m is not None:
-            knot_radii[-1] = dna.endhole_radius_m
+            profile_radii = np.r_[
+                seed_points[0, 1], dna.bore_radii_at_holes_m,
+                dna.bore_radii_at_holes_m[-1], end_radius,
+            ]
+        knot_radii = np.interp(knot_positions, profile_positions, profile_radii)
         bore = TaperedBoreGeometry(
             name=self.seed_bore.name,
             segments=[
@@ -330,8 +596,18 @@ class _GeometryGenomeCodec:
                     label=hole.label,
                     position_m=float(dna.hole_positions_m[index]),
                     diameter_m=float(dna.hole_diameters_m[index]),
-                    chimney_height_m=hole.chimney_height_m,
-                    bevel_deg=dna.bevel_deg if self.config.optimize_bevel else hole.bevel_deg,
+                    chimney_height_m=(
+                        float(dna.chimney_heights_m[index])
+                        if dna.chimney_heights_m is not None else hole.chimney_height_m
+                    ),
+                    bevel_deg=(
+                        float(dna.hole_bevels_deg[index]) if dna.hole_bevels_deg is not None
+                        else dna.bevel_deg if self.config.optimize_bevel else hole.bevel_deg
+                    ),
+                    bevel_side=(
+                        "bore" if self.config.independent_hole_geometry and self.config.optimize_bevel
+                        else hole.bevel_side
+                    ),
                 )
                 for index, hole in enumerate(self.seed_layout.holes)
             ]
@@ -401,6 +677,84 @@ class GeneticGeometryOptimizer:
             )
         return errors
 
+    def _relative_q_score(
+        self, vector: np.ndarray, notes: Sequence[str]
+    ) -> _CandidateScore:
+        bore, layout = self.codec.decode(vector)
+        acoustic_bore: TaperedBoreGeometry | WhistleInstrument = bore
+        if self.mouthpiece is not None:
+            acoustic_bore = WhistleGeometryFactory(
+                temperature=self.temperature
+            ).create_tapered_instrument(self.mouthpiece, bore)
+        model = OpenWInDToneholeModel(
+            acoustic_bore,
+            layout,
+            self.temperature,
+            hole_position_offset_m=self.mouthpiece.l_mouth if self.mouthpiece else 0.0,
+        )
+        base_targets = generate_key_frequencies(self.key_config, "12-TET")
+        requested = list(dict.fromkeys(notes))
+        for note in notes:
+            root = "Octave_Degree_1" if note in SECOND_REGISTER_FINGERINGS else "Degree_1"
+            if root not in requested:
+                requested.append(root)
+
+        errors: dict[str, float] = {}
+        q_factors: dict[str, float | None] = {}
+        missing: set[str] = set()
+        for note in requested:
+            fingering = SECOND_REGISTER_FINGERINGS.get(note, note)
+            if note in SECOND_REGISTER_FINGERINGS and note != "Octave_Degree_1":
+                target = 2.0 * self.tuning.get_target_frequency(
+                    fingering, base_targets[fingering]
+                )
+            else:
+                target = self.tuning.get_target_frequency(note, base_targets[note])
+            upper = note in SECOND_REGISTER_FINGERINGS
+            response = model.response(
+                fingering,
+                target,
+                f_min=(0.8 if upper else 0.75) * target,
+                f_max=(1.2 if upper else 1.25) * target,
+                n_points=1201,
+            )
+            if not len(find_peaks(response.admittance)[0]):
+                errors[note] = MISSING_UPPER_RESONANCE_COST_CENTS
+                q_factors[note] = None
+                missing.add(note)
+                continue
+            errors[note] = float(
+                1200.0 * np.log2(response.peak_frequency_hz / target)
+            )
+            rows = resonance_peak_rows(response.frequencies_hz, response.impedance, "Y")
+            peak = min(rows, key=lambda row: abs(float(row["Peak (Hz)"]) - target))
+            q = peak["Q"]
+            q_factors[note] = float(q) if q is not None else None
+
+        relative_errors: dict[str, float] = {}
+        for note in notes:
+            root = "Octave_Degree_1" if note in SECOND_REGISTER_FINGERINGS else "Degree_1"
+            if note == root:
+                error = errors[note]
+            elif note in missing or root in missing:
+                error = MISSING_UPPER_RESONANCE_COST_CENTS
+            else:
+                error = errors[note] - errors[root]
+            relative_errors[note] = error
+        pitch_cost = float(sum(normalized_pitch_costs(relative_errors).values()))
+        q_reward = float(sum(normalized_q_rewards(
+            {note: q_factors[note] for note in notes},
+            weight=self.config.q_reward_weight, scale=self.config.q_reward_scale,
+        ).values()))
+        cost = pitch_cost - q_reward
+        if not np.isfinite(cost):
+            raise ValueError("Non-finite tuning cost during genetic optimization.")
+        return _CandidateScore(
+            vector, {note: errors[note] for note in notes}, cost, cost, 0.0,
+            relative_errors, {note: q_factors[note] for note in notes},
+            pitch_cost, q_reward,
+        )
+
     def _retune_length(self, vector: np.ndarray) -> tuple[np.ndarray, float]:
         dna = GeometryDNA.from_vector(vector)
         length = dna.pipe_length_m
@@ -449,6 +803,8 @@ class GeneticGeometryOptimizer:
     def _score(
         self, vector: np.ndarray, notes: Sequence[str], *, retune: bool
     ) -> _CandidateScore:
+        if self.config.root_relative_q:
+            return self._relative_q_score(vector, notes)
         root_selected = "Degree_1" in notes
         if retune and root_selected:
             vector, root_error = self._retune_length(vector)
@@ -484,6 +840,39 @@ class GeneticGeometryOptimizer:
         self._evaluations += 1
         return result
 
+    def _evaluate_population(
+        self,
+        population: Sequence[np.ndarray],
+        notes: tuple[str, ...],
+        executor: ProcessPoolExecutor | None,
+    ) -> list[_CandidateScore]:
+        if executor is None:
+            return [self._evaluate(candidate, notes) for candidate in population]
+        keys = []
+        uncached: dict[tuple[float, ...], np.ndarray] = {}
+        for candidate in population:
+            repaired = self.codec.repair(candidate)
+            key = self._individual_key(repaired)
+            keys.append(key)
+            if key not in self._cache:
+                uncached[key] = repaired
+        results = list(executor.map(
+            _score_in_worker, ((candidate, notes) for candidate in uncached.values())
+        ))
+        for key, result in zip(uncached, results):
+            self._cache[key] = result
+            self._evaluations += 1
+        return [self._cache[key] for key in keys]
+
+    def _worker_count(self) -> int:
+        if self.config.workers is None:
+            available = getattr(os, "process_cpu_count", os.cpu_count)() or 1
+            workers = max(1, available - 1)
+        else:
+            workers = self.config.workers
+        limit = 61 if sys.platform == "win32" else self.config.population_size
+        return min(workers, self.config.population_size, limit)
+
     def _mutation_scales(self, vector: np.ndarray) -> np.ndarray:
         dna = GeometryDNA.from_vector(vector)
         length_scale = self.config.mutation_scale
@@ -503,23 +892,96 @@ class GeneticGeometryOptimizer:
                 6,
                 (MAX_HOLE_DIAMETER_M - MIN_HOLE_DIAMETER_M) * length_scale,
             ),
-            15.0 * length_scale if self.config.optimize_bevel else 0.0,
         ]
+        if dna.chimney_heights_m is not None:
+            spans = np.maximum(
+                0.0,
+                self.config.max_outer_diameter_m / 2
+                - dna.bore_radii_at_holes_m - self.config.minimum_wall_m,
+            )
+            scales = np.r_[
+                scales, spans * length_scale,
+                np.full(6, 15.0 * length_scale if self.config.optimize_bevel else 0.0),
+            ]
+        else:
+            scales = np.r_[scales, 15.0 * length_scale if self.config.optimize_bevel else 0.0]
         if dna.endhole_radius_m is not None:
             span = 2.0 * self.codec.seed_bore.segments[-1][1] * self.config.bore_radius_variation_fraction
             scales = np.r_[scales, span * length_scale]
         return scales
 
     def _initial_population(
-        self, seed: np.ndarray, rng: np.random.Generator
+        self,
+        seed: np.ndarray,
+        rng: np.random.Generator,
+        winners: Sequence[np.ndarray] = (),
     ) -> np.ndarray:
-        population = np.repeat(seed[None, :], self.config.population_size, axis=0)
-        scales = self._mutation_scales(seed) * 4.0
-        for index in range(1, self.config.population_size):
-            population[index] = self.codec.repair(
+        population = [seed.copy()]
+        seen = {self._individual_key(seed)}
+        for winner in winners:
+            candidate = self.codec.repair(winner)
+            key = self._individual_key(candidate)
+            if key not in seen and len(population) < self.config.population_size:
+                population.append(candidate)
+                seen.add(key)
+        while len(population) < self.config.population_size:
+            population.append(self._new_random_individual(seed, rng, seen))
+        return np.asarray(population)
+
+    def _winner_archive(self, notes: tuple[str, ...]) -> WinnerArchive | None:
+        if self.config.winner_directory is None:
+            return None
+        context = {
+            "scoring_revision": 4,
+            "genome_schema": 2 if self.config.independent_hole_geometry else 1,
+            "key": asdict(self.key_config),
+            "tuning": asdict(self.tuning),
+            "bore": asdict(self.codec.seed_bore),
+            "holes": [asdict(hole) for hole in self.codec.seed_layout.holes],
+            "temperature": self.temperature,
+            "mouthpiece": asdict(self.mouthpiece) if self.mouthpiece is not None else None,
+            "notes": notes,
+            "geometry_and_scoring": {
+                "bore_radius_variation_fraction": self.config.bore_radius_variation_fraction,
+                "optimize_endhole": self.config.optimize_endhole,
+                "optimize_bevel": self.config.optimize_bevel,
+                "retune_closed_root": self.config.retune_closed_root,
+                "include_second_register": self.config.include_second_register,
+                "root_relative_q": self.config.root_relative_q,
+                "independent_hole_geometry": self.config.independent_hole_geometry,
+                "max_outer_diameter_m": self.config.max_outer_diameter_m,
+                "minimum_wall_m": self.config.minimum_wall_m,
+                "q_reward_weight": self.config.q_reward_weight,
+                "q_reward_scale": self.config.q_reward_scale,
+            },
+        }
+        return WinnerArchive(Path(self.config.winner_directory), context)
+
+    @staticmethod
+    def _individual_key(vector: np.ndarray) -> tuple[float, ...]:
+        return tuple(float(value) for value in vector)
+
+    def _new_random_individual(
+        self,
+        seed: np.ndarray,
+        rng: np.random.Generator,
+        seen: set[tuple[float, ...]],
+    ) -> np.ndarray:
+        scales = np.maximum(
+            self._mutation_scales(seed) * 4.0,
+            2.0 * GEOMETRY_RESOLUTION_M,
+        )
+        for _ in range(1000):
+            candidate = self.codec.repair(
                 seed + rng.normal(size=seed.shape) * scales
             )
-        return population
+            key = self._individual_key(candidate)
+            if key not in seen:
+                seen.add(key)
+                return candidate
+        raise RuntimeError(
+            "Unable to generate a unique individual at 0.1 mm resolution."
+        )
 
     @staticmethod
     def _tournament(
@@ -551,8 +1013,15 @@ class GeneticGeometryOptimizer:
         return self.codec.repair(child)
 
     def optimize(
-        self, notes: Sequence[str] | None = None
+        self,
+        notes: Sequence[str] | None = None,
+        progress_callback: Callable[[int, float, float, int], None] | None = None,
     ) -> GeneticOptimizationResult:
+        """Run the search and optionally report each generation's best score.
+
+        The callback receives the 1-based generation, best cost, best fitness,
+        and number of unique candidates scored so far.
+        """
         available_notes = list(DEGREE_LABELS)
         if self.config.include_second_register:
             available_notes.extend(note for note in SECOND_REGISTER_FINGERINGS if note not in DEGREE_LABELS)
@@ -568,26 +1037,45 @@ class GeneticGeometryOptimizer:
         rng = np.random.default_rng(self.config.random_seed)
         seed = self.codec.from_geometry()
         baseline = self._score(seed, selected_notes, retune=False)
-        population = self._initial_population(seed, rng)
+        archive = self._winner_archive(selected_notes)
+        saved = archive.load() if archive is not None else []
+        if archive is not None and any(len(genome) != len(seed) for genome in saved):
+            raise ValueError(f"Invalid genome length in genetic winner archive: {archive.path}")
 
-        for _ in range(self.config.generations):
-            scores = [self._evaluate(candidate, selected_notes) for candidate in population]
-            elite_indices = sorted(
-                range(len(population)), key=lambda index: scores[index].rank
-            )[: self.config.elite_count]
-            next_population = [population[index].copy() for index in elite_indices]
-            while len(next_population) < self.config.population_size:
-                first = self._tournament(population, scores, rng)
-                second = self._tournament(population, scores, rng)
-                next_population.append(self._child(first, second, rng))
-            population = np.asarray(next_population)
+        with ExitStack() as stack:
+            executor = None
+            workers = self._worker_count()
+            if workers > 1:
+                executor = stack.enter_context(ProcessPoolExecutor(
+                    max_workers=workers,
+                    initializer=_initialize_worker,
+                    initargs=(
+                        self.key_config, self.tuning, self.codec.seed_bore,
+                        self.codec.seed_layout, self.temperature, self.mouthpiece,
+                        self.config,
+                    ),
+                ))
+            if saved:
+                scores = self._evaluate_population(
+                    [np.asarray(genome, dtype=float) for genome in saved],
+                    selected_notes,
+                    executor,
+                )
+                winners = [score.vector for score in sorted(scores, key=lambda score: score.rank)]
+                population = self._initial_population(seed, rng, winners)
+            else:
+                population = self._initial_population(seed, rng)
+            best = self._evolve(
+                population, seed, selected_notes, rng, executor, progress_callback
+            )
 
-        best = min(
-            (self._evaluate(candidate, selected_notes) for candidate in population),
-            key=lambda score: score.rank,
-        )
         if baseline.rank <= best.rank:
             best = baseline
+        if archive is not None:
+            archive.merge([
+                (self._individual_key(score.vector), score.rank)
+                for score in [baseline, *self._cache.values()]
+            ])
         best_vector = best.vector
         bore, layout = self.codec.decode(best_vector)
         root_error = best.errors.get("Degree_1")
@@ -609,6 +1097,55 @@ class GeneticGeometryOptimizer:
             evaluations=self._evaluations,
             root_tuning_satisfied=root_satisfied,
             initial_cent_errors=baseline.errors,
+            relative_cent_errors=best.relative_errors,
+            initial_relative_cent_errors=baseline.relative_errors,
+            q_factors=best.q_factors,
+            initial_q_factors=baseline.q_factors,
+            initial_pitch_cost=baseline.pitch_cost,
+            final_pitch_cost=best.pitch_cost,
+            initial_q_reward=baseline.q_reward,
+            final_q_reward=best.q_reward,
+        )
+
+    def _evolve(
+        self,
+        population: np.ndarray,
+        seed: np.ndarray,
+        selected_notes: tuple[str, ...],
+        rng: np.random.Generator,
+        executor: ProcessPoolExecutor | None,
+        progress_callback: Callable[[int, float, float, int], None] | None,
+    ) -> _CandidateScore:
+        for generation in range(1, self.config.generations + 1):
+            scores = self._evaluate_population(population, selected_notes, executor)
+            generation_best = min(scores, key=lambda score: score.rank)
+            if progress_callback is not None:
+                progress_callback(
+                    generation,
+                    generation_best.cost,
+                    generation_best.fitness,
+                    self._evaluations,
+                )
+            elite_indices = sorted(
+                range(len(population)), key=lambda index: scores[index].rank
+            )[: self.config.elite_count]
+            next_population = [population[index].copy() for index in elite_indices]
+            seen = {self._individual_key(candidate) for candidate in next_population}
+            while len(next_population) < self.config.population_size:
+                first = self._tournament(population, scores, rng)
+                second = self._tournament(population, scores, rng)
+                child = self._child(first, second, rng)
+                key = self._individual_key(child)
+                if key in seen:
+                    child = self._new_random_individual(seed, rng, seen)
+                else:
+                    seen.add(key)
+                next_population.append(child)
+            population = np.asarray(next_population)
+
+        return min(
+            self._evaluate_population(population, selected_notes, executor),
+            key=lambda score: score.rank,
         )
 
 
@@ -621,6 +1158,7 @@ def optimize_geometry_genetically(
     mouthpiece: MouthpieceGeometry | None = None,
     config: GeneticAlgorithmConfig | None = None,
     notes: Sequence[str] | None = None,
+    progress_callback: Callable[[int, float, float, int], None] | None = None,
 ) -> GeneticOptimizationResult:
     """Optimize a geometry seed using a NumPy-based genetic search."""
     return GeneticGeometryOptimizer(
@@ -631,4 +1169,4 @@ def optimize_geometry_genetically(
         temperature=temperature,
         mouthpiece=mouthpiece,
         config=config,
-    ).optimize(notes)
+    ).optimize(notes, progress_callback=progress_callback)

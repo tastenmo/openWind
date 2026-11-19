@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from .geometry import PipeGeometry, TaperedBoreGeometry, UndercutTonehole, WhistleGeometryFactory
 from .genetic_optimizer import (
@@ -43,6 +43,9 @@ class FinalWhistleDesign:
                     "diameter_m": h.diameter_m,
                     "chimney_height_m": h.chimney_height_m,
                     "bevel_deg": h.bevel_deg,
+                    "bevel_side": h.bevel_side,
+                    "radius_in_m": h.radius_in_m,
+                    "radius_out_m": h.radius_out_m,
                 }
                 for h in self.holes.holes
             ],
@@ -100,6 +103,7 @@ class WhistleDesignPipeline:
         holes: ToneholeLayout,
         config: GeneticAlgorithmConfig | None = None,
         notes: Sequence[str] | None = None,
+        progress_callback: Callable[[int, float, float, int], None] | None = None,
     ) -> GeneticOptimizationResult:
         """Refine a bore/layout candidate with the opt-in genetic optimizer."""
         self.genetic_result = optimize_geometry_genetically(
@@ -111,6 +115,7 @@ class WhistleDesignPipeline:
             mouthpiece=self.mouthpiece,
             config=config,
             notes=notes,
+            progress_callback=progress_callback,
         )
         return self.genetic_result
 

@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from .geometry import UndercutTonehole
 from .optimizer import ToneholeLayout
 
 
@@ -22,13 +21,7 @@ def optimize_undercut(layout: ToneholeLayout, bevel_deg: float = 0.0) -> Undercu
     second-octave objective can optimize `bevel_deg` in a subsequent calibration.
     """
     holes = [
-        UndercutTonehole(
-            label=hole.label,
-            position_m=hole.position_m,
-            diameter_m=hole.diameter_m,
-            chimney_height_m=hole.chimney_height_m,
-            bevel_deg=bevel_deg,
-        )
+        replace(hole, bevel_deg=bevel_deg)
         for hole in layout.holes
     ]
     return UndercutOptimizationResult(ToneholeLayout(holes))

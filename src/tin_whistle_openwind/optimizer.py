@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Sequence
 
 import numpy as np
@@ -182,13 +182,7 @@ class OpenWInDToneholeModel:
     ) -> np.ndarray:
         layout = ToneholeLayout(
             [
-                UndercutTonehole(
-                    hole.label,
-                    hole.position_m + self.hole_position_offset_m,
-                    hole.diameter_m,
-                    hole.chimney_height_m,
-                    hole.bevel_deg,
-                )
+                replace(hole, position_m=hole.position_m + self.hole_position_offset_m)
                 for hole in self.layout.holes
             ]
         )

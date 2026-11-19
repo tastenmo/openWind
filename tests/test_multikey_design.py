@@ -111,6 +111,46 @@ def test_tapered_bore_and_undercut_validation():
         UndercutTonehole("bad", 0.1, 0.006, 0.003, bevel_deg=16.0)
 
 
+def test_conical_bore_side_hole_survives_acoustic_offset_and_export(monkeypatch):
+    from dataclasses import replace
+    import numpy as np
+    import tin_whistle_openwind.optimizer as optimizer_module
+    from tin_whistle_openwind.optimize_undercut import optimize_undercut
+
+    hole = UndercutTonehole("L1", 0.09, 0.006, 0.0012, 12.0, bevel_side="bore")
+    assert hole.radius_out_m == pytest.approx(0.003)
+    assert hole.radius_in_m == pytest.approx(0.003 + 0.0012 * math.tan(math.radians(12)))
+    assert hole.to_row()[3:] == pytest.approx([
+        hole.radius_in_m, hole.radius_out_m, hole.chimney_height_m,
+    ])
+    layout = ToneholeLayout([hole])
+    copied = optimize_undercut(layout, bevel_deg=5).layout.holes[0]
+    assert copied == replace(hole, bevel_deg=5)
+    captured = []
+
+    def computation(frequencies, main_bore, holes, *args, **kwargs):
+        captured.extend(holes)
+        return SimpleNamespace(impedance=np.ones(len(frequencies), dtype=complex))
+
+    monkeypatch.setattr(optimizer_module, "ImpedanceComputation", computation)
+    bore = TaperedBoreGeometry.cylindrical("test", 0.0071, 0.25)
+    model = optimizer_module.OpenWInDToneholeModel(bore, layout, hole_position_offset_m=0.035)
+    model.impedance(np.array([500., 600., 700.]), "Degree_1")
+    assert captured[1][2:] == pytest.approx([
+        0.125, hole.radius_in_m, hole.radius_out_m, hole.chimney_height_m,
+    ])
+    pipeline = WhistleDesignPipeline("Soprano_D")
+    pipeline.genetic_result = SimpleNamespace(
+        bore=bore, layout=layout, dna=SimpleNamespace(endhole_radius_m=None),
+    )
+    design = pipeline.run_stage_3_undercut_optimization(bore, layout)
+    assert design.holes is layout
+    saved_hole = design.to_dict()["holes"][0]
+    assert saved_hole["bevel_side"] == "bore"
+    assert saved_hole["radius_in_m"] == hole.radius_in_m
+    assert saved_hole["radius_out_m"] == hole.radius_out_m
+
+
 def test_pipeline_stage_outputs(record_property):
     pipeline = WhistleDesignPipeline("Soprano_D", IRISH_FOLK_HYBRID)
     bore = pipeline.run_stage_1_length_endhole_optimization(starting_bore_radius_m=0.0071)

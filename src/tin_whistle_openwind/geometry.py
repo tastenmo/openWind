@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from openwind import ImpedanceComputation, Player
@@ -193,27 +193,41 @@ class TaperedBoreGeometry:
 
 @dataclass
 class UndercutTonehole:
-    """A tonehole with an optional inner chimney bevel (undercut), 0-15 degrees."""
+    """Conical chimney; diameter is at the unbeveled end, angle is 0-15 degrees.
+
+    Legacy ``outer`` bevels flare toward the finger. A ``bore`` bevel keeps
+    the finger opening fixed and flares inward over the full chimney height.
+    """
 
     label: str
     position_m: float
     diameter_m: float
     chimney_height_m: float
     bevel_deg: float = 0.0
+    bevel_side: Literal["outer", "bore"] = "outer"
 
     def __post_init__(self) -> None:
+        if self.bevel_side not in ("outer", "bore"):
+            raise ValueError("bevel_side must be 'outer' or 'bore'.")
+        if (
+            not np.isfinite(self.diameter_m) or self.diameter_m <= 0
+            or not np.isfinite(self.chimney_height_m) or self.chimney_height_m <= 0
+        ):
+            raise ValueError("Tonehole diameter and chimney height must be finite and positive.")
         if not 0.0 <= self.bevel_deg <= 15.0:
             raise ValueError(f"bevel_deg must be within [0, 15], got {self.bevel_deg}.")
 
     @property
     def radius_in_m(self) -> float:
-        """Chimney radius at the bore wall (unaffected by undercutting)."""
-        return self.diameter_m / 2.0
+        """Chimney radius at the bore wall (OpenWInD's ``radius``)."""
+        flare = self.chimney_height_m * np.tan(np.radians(self.bevel_deg))
+        return self.diameter_m / 2.0 + (flare if self.bevel_side == "bore" else 0.0)
 
     @property
     def radius_out_m(self) -> float:
-        """Chimney radius at the outer (finger) side, flared by the undercut bevel."""
-        return self.radius_in_m + self.chimney_height_m * np.tan(np.radians(self.bevel_deg))
+        """Chimney radius at the finger side (OpenWInD's ``radius_out``)."""
+        flare = self.chimney_height_m * np.tan(np.radians(self.bevel_deg))
+        return self.diameter_m / 2.0 + (flare if self.bevel_side == "outer" else 0.0)
 
     def to_row(self) -> list[Any]:
         """An OpenWInD `holes_valves` data row (conical chimney via radius/radius_out)."""
