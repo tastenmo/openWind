@@ -97,7 +97,7 @@ def test_codec_repairs_genes_and_decodes_radius_at_moving_holes():
         assert 0.8 * previous_radius - 1e-12 <= radius <= previous_radius + 1e-12
         assert radius / 0.0001 == pytest.approx(round(radius / 0.0001))
         previous_radius = radius
-    assert all(hole.bevel_deg == pytest.approx(15.0) for hole in decoded_holes.holes)
+    assert all(hole.bevel_deg == pytest.approx(30.0) for hole in decoded_holes.holes)
     bore_positions = np.array([position for position, _ in decoded_bore.segments])
     bore_radii = np.array([radius for _, radius in decoded_bore.segments])
     radii_at_holes = np.interp(decoded_holes.positions_m, bore_positions, bore_radii)
@@ -118,6 +118,130 @@ def test_codec_rejects_nonfinite_genes():
 
     with pytest.raises(ValueError, match="finite"):
         codec.repair(genome)
+
+
+@pytest.mark.parametrize(
+    ("proposed_bevel", "expected_bevel"),
+    [
+        (2.4, 0.0), (2.5, 5.0), (2.6, 5.0), (12.4, 10.0),
+        (12.6, 15.0), (30.0, 30.0), (45.0, 30.0),
+    ],
+)
+def test_codec_quantizes_bevels_to_five_degree_steps(proposed_bevel, expected_bevel):
+    bore, layout = seed_geometry()
+    codec = _GeometryGenomeCodec(bore, layout, GeneticAlgorithmConfig())
+    genome = codec.from_geometry()
+    genome[19] = proposed_bevel
+
+    decoded = codec.decode(codec.repair(genome))[1]
+
+    assert [hole.bevel_deg for hole in decoded.holes] == pytest.approx(
+        [expected_bevel] * 6
+    )
+
+
+@pytest.mark.parametrize("independent", [False, True])
+def test_repair_diagnostics_measure_proposals_before_and_after_repair(independent):
+    bore, layout = seed_geometry()
+    optimizer = GeneticGeometryOptimizer(
+        SUPPORTED_KEYS["Soprano_D"], IRISH_FOLK_HYBRID, bore, layout,
+        config=GeneticAlgorithmConfig(
+            independent_hole_geometry=independent, optimize_endhole=True,
+            winner_directory=None,
+        ),
+    )
+    seed = optimizer.codec.from_geometry()
+    angle_index = 25 if independent else 19
+    before_a, before_b = seed.copy(), seed.copy()
+    before_a[angle_index], before_b[angle_index] = 2.4, 4.8
+    samples = [
+        (before_a, optimizer.codec.repair(before_a)),
+        (before_b, optimizer.codec.repair(before_b)),
+    ]
+
+    diagnostic = optimizer._summarize_repair(1, seed, 1, samples)
+
+    assert diagnostic.proposal_count == 2
+    assert diagnostic.duplicate_count == 1
+    assert diagnostic.gene_names[angle_index] == ("bevel_L1" if independent else "bevel")
+    assert diagnostic.units[angle_index] == "deg"
+    assert diagnostic.before_std[angle_index] == pytest.approx(1.2)
+    assert diagnostic.after_std[angle_index] == pytest.approx(2.5)
+    assert diagnostic.changed_fraction[angle_index] == pytest.approx(1.0)
+    assert diagnostic.gene_names[-1] == "endhole_radius"
+    assert diagnostic.units[-1] == "mm"
+
+
+def test_optimizer_collects_repair_diagnostics_each_generation(monkeypatch):
+    bore, layout = seed_geometry()
+    optimizer = GeneticGeometryOptimizer(
+        SUPPORTED_KEYS["Soprano_D"], IRISH_FOLK_HYBRID, bore, layout,
+        config=GeneticAlgorithmConfig(
+            population_size=4, generations=2, workers=1, winner_directory=None,
+            random_seed=42, retune_closed_root=False,
+        ),
+    )
+    monkeypatch.setattr(
+        optimizer, "_cent_errors",
+        lambda vector, notes: {note: 0.0 for note in notes},
+    )
+    result = optimizer.optimize(["Degree_1"])
+
+    assert [d.generation for d in result.repair_diagnostics] == [1, 2]
+    for diagnostic in result.repair_diagnostics:
+        assert diagnostic.proposal_count == 2
+        assert 0 <= diagnostic.duplicate_count <= diagnostic.proposal_count
+        assert len(diagnostic.gene_names) == len(result.dna.to_vector())
+        assert np.all((0 <= diagnostic.changed_fraction) & (diagnostic.changed_fraction <= 1))
+    assert optimizer._repair_samples is None
+
+
+def test_repair_diagnostics_count_replaced_duplicates(monkeypatch):
+    bore, layout = seed_geometry()
+    optimizer = GeneticGeometryOptimizer(
+        SUPPORTED_KEYS["Soprano_D"], IRISH_FOLK_HYBRID, bore, layout,
+        config=GeneticAlgorithmConfig(
+            population_size=4, generations=1, workers=1, winner_directory=None,
+            random_seed=42, retune_closed_root=False, crossover_rate=0.0,
+            mutation_rate=0.0,
+        ),
+    )
+    monkeypatch.setattr(
+        optimizer, "_cent_errors",
+        lambda vector, notes: {note: 0.0 for note in notes},
+    )
+    monkeypatch.setattr(
+        optimizer, "_tournament", lambda population, scores, rng: population[0],
+    )
+
+    diagnostic = optimizer.optimize(["Degree_1"]).repair_diagnostics[0]
+
+    assert diagnostic.proposal_count == 2
+    assert diagnostic.duplicate_count == 2
+    assert diagnostic.before_std == pytest.approx(np.zeros(len(diagnostic.gene_names)))
+    assert diagnostic.after_std == pytest.approx(np.zeros(len(diagnostic.gene_names)))
+
+
+def test_recording_repair_does_not_change_child_or_random_stream():
+    bore, layout = seed_geometry()
+    optimizer = GeneticGeometryOptimizer(
+        SUPPORTED_KEYS["Soprano_D"], IRISH_FOLK_HYBRID, bore, layout,
+        config=GeneticAlgorithmConfig(winner_directory=None),
+    )
+    seed = optimizer.codec.from_geometry()
+    unrecorded_rng = np.random.default_rng(42)
+    recorded_rng = np.random.default_rng(42)
+    expected = optimizer._child(seed, seed, unrecorded_rng)
+    optimizer._repair_samples = []
+
+    actual = optimizer._child(seed, seed, recorded_rng)
+
+    assert actual == pytest.approx(expected)
+    assert recorded_rng.random() == unrecorded_rng.random()
+    assert len(optimizer._repair_samples) == 1
+    before, after = optimizer._repair_samples[0]
+    assert after == pytest.approx(actual)
+    assert optimizer.codec.repair(before) == pytest.approx(actual)
 
 
 def test_joint_geometry_genes_move_holes_bore_and_endhole_but_not_bevel():
@@ -441,7 +565,7 @@ def test_independent_holes_and_offspring_obey_coupled_constraints():
     first = codec.repair(seed.to_vector())
     _, independent = codec.decode(first)
     assert [h.chimney_height_m for h in independent.holes] == pytest.approx(seed.chimney_heights_m)
-    assert [h.bevel_deg for h in independent.holes] == pytest.approx(seed.hole_bevels_deg)
+    assert [h.bevel_deg for h in independent.holes] == pytest.approx([0, 0, 5, 5, 5, 5])
     extreme = GeometryDNA.from_vector(first)
     extreme.bore_radii_at_holes_m[:] = 0.001
     extreme.hole_diameters_m[:] = 0.008
@@ -463,7 +587,8 @@ def test_independent_holes_and_offspring_obey_coupled_constraints():
             assert 0.0009 - 1e-12 <= hole.chimney_height_m
             assert 2 * (radius + hole.chimney_height_m) <= 0.016 + 1e-12
             assert hole.bevel_side == "bore"
-            assert 0 <= hole.bevel_deg <= 15
+            assert 0 <= hole.bevel_deg <= 30
+            assert hole.bevel_deg % 5 == pytest.approx(0)
             assert hole.radius_out_m <= hole.radius_in_m <= radius + 1e-12
             assert 0.005 - 1e-12 <= 2 * hole.radius_out_m <= 0.008 + 1e-12
 
@@ -713,6 +838,87 @@ def test_winner_archive_reuses_and_rescores_compatible_candidates(tmp_path, monk
     assert len(archive.load()) <= 10
 
 
+def test_logbook_records_completed_runs_and_archive_snapshot(tmp_path, monkeypatch):
+    bore, layout = seed_geometry()
+    monkeypatch.setattr(
+        GeneticGeometryOptimizer, "_cent_errors",
+        lambda self, vector, notes: {note: float(vector[13] * 1000) for note in notes},
+    )
+    config = GeneticAlgorithmConfig(
+        population_size=4, generations=2, random_seed=42, workers=1,
+        retune_closed_root=False, winner_directory=tmp_path / "winners",
+        logbook_directory=tmp_path / "logbook",
+        independent_hole_geometry=True, optimize_endhole=True,
+    )
+    optimizer = GeneticGeometryOptimizer(
+        SUPPORTED_KEYS["Soprano_D"], IRISH_FOLK_HYBRID, bore, layout, config=config,
+    )
+    archive = optimizer._winner_archive(("Degree_1",))
+    assert archive is not None
+    seed = optimizer.codec.from_geometry()
+    archive.merge([(tuple(seed), (0.0, 100.0))])
+    saved = archive.load()
+    reports = []
+
+    result = optimizer.optimize(["Degree_1"], progress_callback=lambda *args: reports.append(args))
+
+    assert result.logbook_path is not None
+    assert result.logbook_path.parent == tmp_path / "logbook"
+    payload = json.loads(result.logbook_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["config"]["random_seed"] == 42
+    assert payload["archive"]["path"] == str(archive.path)
+    assert payload["archive"]["context"] == archive.context
+    assert payload["archive"]["saved_genomes_at_start"] == [list(v) for v in saved]
+    assert payload["initial_rng_state"]["bit_generator"] == "PCG64"
+    assert payload["seed_genome"] == pytest.approx(seed)
+    assert [row["best_cost"] for row in payload["generation_history"]] == pytest.approx(
+        [report[1] for report in reports]
+    )
+    assert payload["result"]["final_cost"] == pytest.approx(result.final_cost)
+    assert payload["result"]["dna"]["hole_bevels_deg"] == pytest.approx(
+        result.dna.hole_bevels_deg
+    )
+    assert len(payload["result"]["repair_diagnostics"]) == config.generations
+    assert payload["result"]["repair_diagnostics"][0]["gene_names"][25] == "bevel_L1"
+
+    second = optimizer.optimize(["Degree_1"])
+    assert second.logbook_path != result.logbook_path
+    assert result.logbook_path.exists()
+    assert second.logbook_path is not None and second.logbook_path.exists()
+
+
+def test_logbook_can_be_disabled_and_reports_write_failure(tmp_path, monkeypatch):
+    bore, layout = seed_geometry()
+    monkeypatch.setattr(
+        GeneticGeometryOptimizer, "_cent_errors",
+        lambda self, vector, notes: {note: 0.0 for note in notes},
+    )
+    config = GeneticAlgorithmConfig(
+        population_size=4, generations=1, random_seed=42, workers=1,
+        retune_closed_root=False, winner_directory=None,
+    )
+    args = (SUPPORTED_KEYS["Soprano_D"], IRISH_FOLK_HYBRID, bore, layout)
+    assert GeneticGeometryOptimizer(*args, config=config).optimize(["Degree_1"]).logbook_path is None
+    assert list(tmp_path.iterdir()) == []
+
+    enabled = GeneticGeometryOptimizer(
+        *args, config=replace(config, random_seed=None, logbook_directory=tmp_path / "logs"),
+    ).optimize(["Degree_1"])
+    assert enabled.logbook_path is not None
+    payload = json.loads(enabled.logbook_path.read_text(encoding="utf-8"))
+    assert payload["archive"]["path"] is None
+    assert payload["archive"]["saved_genomes_at_start"] == []
+    assert payload["initial_rng_state"]["bit_generator"] == "PCG64"
+    assert payload["config"]["random_seed"] is None
+
+    blocked = tmp_path / "not-a-directory"
+    blocked.write_text("occupied", encoding="utf-8")
+    optimizer = GeneticGeometryOptimizer(*args, config=replace(config, logbook_directory=blocked))
+    with pytest.raises(OSError):
+        optimizer.optimize(["Degree_1"])
+
+
 def test_winner_archive_rejects_corruption_and_disable_avoids_files(tmp_path, monkeypatch):
     bore, layout = seed_geometry()
     config = GeneticAlgorithmConfig(workers=1, winner_directory=tmp_path)
@@ -852,7 +1058,7 @@ def test_genetic_search_runs_against_openwind():
     result.layout.validate(result.bore.length_m)
 
 
-@pytest.mark.parametrize("retune, expected_bevel", [(True, 8.0), (False, 0.0)])
+@pytest.mark.parametrize("retune, expected_bevel", [(True, 10.0), (False, 0.0)])
 def test_length_retuning_allows_an_octave_improvement(monkeypatch, retune, expected_bevel):
     bore, layout = seed_geometry()
     optimizer = GeneticGeometryOptimizer(

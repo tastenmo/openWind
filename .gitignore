@@ -6,3 +6,4 @@ __pycache__/
 artifacts/*
 !artifacts/.gitkeep
 data/ga-winners/
+data/ga-logbook/

@@ -56,7 +56,8 @@ increase. The decoded bore interpolates between these radii and stays
 non-increasing through the terminal taper. When the endhole is fixed, the hole
 radii cannot shrink below it. The search also respects the existing ±5% pipe
 length range, 5–8 mm hole diameters, within-hand spacing, hole order,
-30 mm bottom-hole clearance, and 0–15° bevel bounds.
+30 mm bottom-hole clearance, and 0–30° bevel bounds in 5° steps when
+bevel optimization is enabled.
 
 ```python
 from tin_whistle_openwind import GeneticAlgorithmConfig, WhistleDesignPipeline
@@ -118,6 +119,15 @@ set another directory path. Archives change the initial population, so a fixed
 random seed is reproducible only with the same archive snapshot. Restart a
 running notebook kernel after updating the optimizer code.
 
+Set `logbook_directory` to a directory to save each completed GA run as a
+separate JSON file. The genetic notebook uses `data/ga-logbook/`; the API
+default is `None` (disabled). Each log includes the configuration, starting
+RNG state, seed genome, archive context and loaded genomes, generation
+history, winner geometry, scores, and repair diagnostics. The returned
+`result.logbook_path` identifies the file. The logbook is separate from the
+winner archive; failed or interrupted runs are not logged, and write errors
+are raised. Logs are written after the winner archive is updated.
+
 Use [the saved-winner review notebook](notebooks/genetic_winner_results.ipynb)
 to select an archive and winner without rerunning the optimization. It
 reconstructs the saved seed and mouthpiece, recomputes the leaderboard, checks
@@ -141,12 +151,20 @@ share becomes 100%.
 
 The genetic notebook enables `independent_hole_geometry=True` and
 `optimize_bevel=True`. Each hole independently varies its chimney height
-and 0-15 degree bore-side conical bevel. Configure `max_outer_diameter_m`
-(notebook: 0.016 m) and `minimum_wall_m` (0.0009 m). Height is on the
+and bore-side conical bevel in 5-degree steps from 0 to 30 degrees. Configure
+`max_outer_diameter_m` (notebook: 0.016 m) and `minimum_wall_m` (0.0009 m). Height is on the
 0.1 mm grid between the minimum wall and `outer_diameter/2 - local_bore_radius`.
 Local exterior radii may vary; this is not a uniform cylindrical outer surface.
 The fixed inlet must fit the body envelope or the optimizer raises an error.
 Constraints are reapplied after crossover and mutation.
+
+`result.repair_diagnostics` reports offspring proposals by breeding generation:
+per-gene standard deviations before and after repair (mm or degrees), the
+fraction changed by repair, and duplicate proposals replaced. These samples
+include duplicates but exclude elites, initial candidates, and their random
+replacements. Before-repair proposals may be infeasible, and the changed
+fraction includes grid rounding as well as constraint enforcement; it is not a
+constraint-violation rate. The genetic notebook displays both tables.
 
 In this mode, the 5-8 mm hole diameter describes the finger opening.
 Following [OpenWInD's conical-hole model](https://files.inria.fr/openwind/docs/examples/technical.Ex8_conical_holes_deviation_pipes.html),

@@ -107,8 +107,10 @@ def test_tapered_bore_and_undercut_validation():
     assert bore.segments[-1][1] == pytest.approx(0.0068)
     hole = UndercutTonehole("hole1", 0.1, 0.006, 0.003, bevel_deg=15.0)
     assert hole.radius_out_m > hole.radius_in_m
+    maximum_bevel = UndercutTonehole("maximum", 0.1, 0.006, 0.003, bevel_deg=30.0)
+    assert maximum_bevel.bevel_deg == 30.0
     with pytest.raises(ValueError):
-        UndercutTonehole("bad", 0.1, 0.006, 0.003, bevel_deg=16.0)
+        UndercutTonehole("bad", 0.1, 0.006, 0.003, bevel_deg=31.0)
 
 
 def test_conical_bore_side_hole_survives_acoustic_offset_and_export(monkeypatch):

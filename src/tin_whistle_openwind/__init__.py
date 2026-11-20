@@ -10,6 +10,7 @@ from .genetic_optimizer import (
 	GeneticAlgorithmConfig,
 	GeneticGeometryOptimizer,
 	GeneticOptimizationResult,
+	GeneticRepairDiagnostics,
 	GeometryDNA,
 	optimize_geometry_genetically,
 )
@@ -29,6 +30,7 @@ __all__ = [
 	"GeneticAlgorithmConfig",
 	"GeneticGeometryOptimizer",
 	"GeneticOptimizationResult",
+	"GeneticRepairDiagnostics",
 	"GeometryDNA",
 	"IRISH_FOLK_HYBRID",
 	"InverseToneholeOptimizationResult",

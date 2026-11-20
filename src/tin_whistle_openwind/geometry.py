@@ -12,6 +12,7 @@ from openwind import ImpedanceComputation, Player
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 DEFAULT_TEMPERATURE = 20.0
+MAX_BEVEL_DEG = 30.0
 
 
 @dataclass
@@ -193,7 +194,7 @@ class TaperedBoreGeometry:
 
 @dataclass
 class UndercutTonehole:
-    """Conical chimney; diameter is at the unbeveled end, angle is 0-15 degrees.
+    """Conical chimney; diameter is at the unbeveled end, angle is 0-30 degrees.
 
     Legacy ``outer`` bevels flare toward the finger. A ``bore`` bevel keeps
     the finger opening fixed and flares inward over the full chimney height.
@@ -214,8 +215,10 @@ class UndercutTonehole:
             or not np.isfinite(self.chimney_height_m) or self.chimney_height_m <= 0
         ):
             raise ValueError("Tonehole diameter and chimney height must be finite and positive.")
-        if not 0.0 <= self.bevel_deg <= 15.0:
-            raise ValueError(f"bevel_deg must be within [0, 15], got {self.bevel_deg}.")
+        if not 0.0 <= self.bevel_deg <= MAX_BEVEL_DEG:
+            raise ValueError(
+                f"bevel_deg must be within [0, {MAX_BEVEL_DEG:g}], got {self.bevel_deg}."
+            )
 
     @property
     def radius_in_m(self) -> float:

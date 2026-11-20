@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import os
 import sys
+import json
+import tempfile
+import uuid
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Sequence
+from time import perf_counter
+from typing import Any, Callable, Sequence
 
 import numpy as np
 from scipy.optimize import brentq
@@ -17,6 +22,7 @@ from scipy.signal import find_peaks
 from .geometry import (
     DEFAULT_TEMPERATURE,
     DEFAULT_DATA_DIR,
+    MAX_BEVEL_DEG,
     MouthpieceGeometry,
     TaperedBoreGeometry,
     UndercutTonehole,
@@ -45,7 +51,38 @@ from .tuning import (
 
 MISSING_UPPER_RESONANCE_COST_CENTS = 1200.0
 GEOMETRY_RESOLUTION_M = 1e-4
+BEVEL_RESOLUTION_DEG = 5.0
 ROOT_ERROR_WEIGHT = 10.0
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"Cannot serialize {type(value).__name__} in genetic run log.")
+
+
+def _write_run_log(directory: Path, payload: dict[str, Any]) -> Path:
+    serialized = json.dumps(payload, default=_json_value, indent=2, allow_nan=False)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{uuid.uuid4().hex}.json"
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory,
+            prefix=".ga-run-", suffix=".tmp", delete=False,
+        ) as file:
+            temporary = file.name
+            file.write(serialized)
+            file.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
+    return path
 
 
 def _normalized_note_weights(
@@ -123,6 +160,7 @@ class GeneticAlgorithmConfig:
     root_relative_q: bool = False
     workers: int | None = None
     winner_directory: Path | str | None = DEFAULT_DATA_DIR / "ga-winners"
+    logbook_directory: Path | str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.population_size, int) or isinstance(self.population_size, bool):
@@ -181,6 +219,11 @@ class GeneticAlgorithmConfig:
             or not str(self.winner_directory).strip()
         ):
             raise ValueError("winner_directory must be a directory path or None.")
+        if self.logbook_directory is not None and (
+            not isinstance(self.logbook_directory, (str, Path))
+            or not str(self.logbook_directory).strip()
+        ):
+            raise ValueError("logbook_directory must be a directory path or None.")
 
 
 @dataclass
@@ -253,6 +296,20 @@ class GeometryDNA:
 
 
 @dataclass
+class GeneticRepairDiagnostics:
+    """Variation and repair rates for offspring proposals in one generation."""
+
+    generation: int
+    proposal_count: int
+    duplicate_count: int
+    gene_names: tuple[str, ...]
+    units: tuple[str, ...]
+    before_std: np.ndarray
+    after_std: np.ndarray
+    changed_fraction: np.ndarray
+
+
+@dataclass
 class GeneticOptimizationResult:
     """Best candidate and diagnostics from a genetic geometry search."""
 
@@ -276,6 +333,8 @@ class GeneticOptimizationResult:
     final_pitch_cost: float | None = None
     initial_q_reward: float = 0.0
     final_q_reward: float = 0.0
+    repair_diagnostics: list[GeneticRepairDiagnostics] = field(default_factory=list)
+    logbook_path: Path | None = None
 
     @property
     def improved(self) -> bool:
@@ -403,6 +462,14 @@ class _GeometryGenomeCodec:
         units = int(np.clip(cls._grid_units(value_m), lower_units, upper_units))
         return units * GEOMETRY_RESOLUTION_M
 
+    @staticmethod
+    def _quantize_bevel(value_deg: float, maximum_deg: float = MAX_BEVEL_DEG) -> float:
+        maximum_units = int(np.floor(maximum_deg / BEVEL_RESOLUTION_DEG + 1e-12))
+        units = int(np.clip(
+            np.floor(value_deg / BEVEL_RESOLUTION_DEG + 0.5), 0, maximum_units
+        ))
+        return float(units * BEVEL_RESOLUTION_DEG)
+
     def _minimum_length_for_bottom_hole(self, position_m: float) -> float:
         terminal_length = (
             self.seed_bore.length_m - self.seed_bore.segments[-2][0]
@@ -486,9 +553,10 @@ class _GeometryGenomeCodec:
             ],
             dtype=float,
         )
-        bevel_deg = float(np.clip(dna.bevel_deg, 0.0, 15.0))
-        if not self.config.optimize_bevel:
-            bevel_deg = self._seed_bevel()
+        bevel_deg = (
+            self._quantize_bevel(dna.bevel_deg)
+            if self.config.optimize_bevel else self._seed_bevel()
+        )
         heights = bevels = None
         if self.config.independent_hole_geometry:
             if dna.chimney_heights_m is None or dna.hole_bevels_deg is None:
@@ -501,12 +569,15 @@ class _GeometryGenomeCodec:
                 for height, radius in zip(dna.chimney_heights_m, radii)
             ])
             bevels = np.asarray([
-                hole.bevel_deg if not self.config.optimize_bevel else float(np.clip(
-                    angle, 0.0, min(
-                        15.0,
-                        np.degrees(np.arctan(max(0.0, radius - diameter / 2) / height)),
+                hole.bevel_deg if not self.config.optimize_bevel else self._quantize_bevel(
+                    angle,
+                    min(
+                        MAX_BEVEL_DEG,
+                        np.degrees(
+                            np.arctan(max(0.0, radius - diameter / 2) / height)
+                        ),
                     ),
-                ))
+                )
                 for hole, angle, radius, diameter, height in zip(
                     self.seed_layout.holes, dna.hole_bevels_deg, radii, diameters, heights
                 )
@@ -637,6 +708,7 @@ class GeneticGeometryOptimizer:
         self.codec = _GeometryGenomeCodec(bore, layout, self.config)
         self._evaluations = 0
         self._cache: dict[tuple[float, ...], _CandidateScore] = {}
+        self._repair_samples: list[tuple[np.ndarray, np.ndarray]] | None = None
 
     def _cent_errors(
         self, vector: np.ndarray, notes: Sequence[str]
@@ -901,10 +973,16 @@ class GeneticGeometryOptimizer:
             )
             scales = np.r_[
                 scales, spans * length_scale,
-                np.full(6, 15.0 * length_scale if self.config.optimize_bevel else 0.0),
+                np.full(
+                    6,
+                    MAX_BEVEL_DEG * length_scale if self.config.optimize_bevel else 0.0,
+                ),
             ]
         else:
-            scales = np.r_[scales, 15.0 * length_scale if self.config.optimize_bevel else 0.0]
+            scales = np.r_[
+                scales,
+                MAX_BEVEL_DEG * length_scale if self.config.optimize_bevel else 0.0,
+            ]
         if dna.endhole_radius_m is not None:
             span = 2.0 * self.codec.seed_bore.segments[-1][1] * self.config.bore_radius_variation_fraction
             scales = np.r_[scales, span * length_scale]
@@ -928,10 +1006,8 @@ class GeneticGeometryOptimizer:
             population.append(self._new_random_individual(seed, rng, seen))
         return np.asarray(population)
 
-    def _winner_archive(self, notes: tuple[str, ...]) -> WinnerArchive | None:
-        if self.config.winner_directory is None:
-            return None
-        context = {
+    def _archive_context(self, notes: tuple[str, ...]) -> dict[str, Any]:
+        return {
             "scoring_revision": 4,
             "genome_schema": 2 if self.config.independent_hole_geometry else 1,
             "key": asdict(self.key_config),
@@ -945,6 +1021,8 @@ class GeneticGeometryOptimizer:
                 "bore_radius_variation_fraction": self.config.bore_radius_variation_fraction,
                 "optimize_endhole": self.config.optimize_endhole,
                 "optimize_bevel": self.config.optimize_bevel,
+                "max_bevel_deg": MAX_BEVEL_DEG,
+                "bevel_resolution_deg": BEVEL_RESOLUTION_DEG,
                 "retune_closed_root": self.config.retune_closed_root,
                 "include_second_register": self.config.include_second_register,
                 "root_relative_q": self.config.root_relative_q,
@@ -955,7 +1033,10 @@ class GeneticGeometryOptimizer:
                 "q_reward_scale": self.config.q_reward_scale,
             },
         }
-        return WinnerArchive(Path(self.config.winner_directory), context)
+    def _winner_archive(self, notes: tuple[str, ...]) -> WinnerArchive | None:
+        if self.config.winner_directory is None:
+            return None
+        return WinnerArchive(Path(self.config.winner_directory), self._archive_context(notes))
 
     @staticmethod
     def _individual_key(vector: np.ndarray) -> tuple[float, ...]:
@@ -1010,7 +1091,46 @@ class GeneticGeometryOptimizer:
             rng.normal(size=np.count_nonzero(mutation_mask))
             * scales[mutation_mask]
         )
-        return self.codec.repair(child)
+        repaired = self.codec.repair(child)
+        if self._repair_samples is not None:
+            self._repair_samples.append((child.copy(), repaired.copy()))
+        return repaired
+
+    def _summarize_repair(
+        self, generation: int, seed: np.ndarray, duplicate_count: int,
+        samples: list[tuple[np.ndarray, np.ndarray]],
+    ) -> GeneticRepairDiagnostics:
+        names = (
+            ["pipe_length"]
+            + [f"position_{label}" for label in ACTIVE_HOLE_LABELS]
+            + [f"bore_radius_{label}" for label in ACTIVE_HOLE_LABELS]
+            + [f"diameter_{label}" for label in ACTIVE_HOLE_LABELS]
+        )
+        units = ["mm"] * len(names)
+        dna = GeometryDNA.from_vector(seed)
+        if dna.chimney_heights_m is not None:
+            names += [f"chimney_{label}" for label in ACTIVE_HOLE_LABELS]
+            names += [f"bevel_{label}" for label in ACTIVE_HOLE_LABELS]
+            units += ["mm"] * 6 + ["deg"] * 6
+        else:
+            names.append("bevel")
+            units.append("deg")
+        if dna.endhole_radius_m is not None:
+            names.append("endhole_radius")
+            units.append("mm")
+        before = np.asarray([sample[0] for sample in samples])
+        after = np.asarray([sample[1] for sample in samples])
+        scale = np.asarray([1000.0 if unit == "mm" else 1.0 for unit in units])
+        return GeneticRepairDiagnostics(
+            generation=generation,
+            proposal_count=len(samples),
+            duplicate_count=duplicate_count,
+            gene_names=tuple(names),
+            units=tuple(units),
+            before_std=np.std(before, axis=0) * scale,
+            after_std=np.std(after, axis=0) * scale,
+            changed_fraction=np.mean(np.abs(before - after) > 1e-12, axis=0),
+        )
 
     def optimize(
         self,
@@ -1032,9 +1152,14 @@ class GeneticGeometryOptimizer:
         if unknown_notes:
             raise ValueError(f"Unknown tuning notes: {sorted(unknown_notes)}.")
 
+        started_at = datetime.now(timezone.utc)
+        started = perf_counter()
         self._cache.clear()
         self._evaluations = 0
+        repair_diagnostics: list[GeneticRepairDiagnostics] = []
+        generation_history: list[dict[str, int | float]] = []
         rng = np.random.default_rng(self.config.random_seed)
+        initial_rng_state = rng.bit_generator.state
         seed = self.codec.from_geometry()
         baseline = self._score(seed, selected_notes, retune=False)
         archive = self._winner_archive(selected_notes)
@@ -1065,9 +1190,13 @@ class GeneticGeometryOptimizer:
                 population = self._initial_population(seed, rng, winners)
             else:
                 population = self._initial_population(seed, rng)
-            best = self._evolve(
-                population, seed, selected_notes, rng, executor, progress_callback
-            )
+            try:
+                best = self._evolve(
+                    population, seed, selected_notes, rng, executor, progress_callback,
+                    repair_diagnostics, generation_history,
+                )
+            finally:
+                self._repair_samples = None
 
         if baseline.rank <= best.rank:
             best = baseline
@@ -1084,7 +1213,7 @@ class GeneticGeometryOptimizer:
             if root_error is None
             else bool(abs(root_error) <= ROOT_TUNING_TOLERANCE_CENTS)
         )
-        return GeneticOptimizationResult(
+        result = GeneticOptimizationResult(
             bore=bore,
             layout=layout,
             dna=GeometryDNA.from_vector(best_vector),
@@ -1105,7 +1234,30 @@ class GeneticGeometryOptimizer:
             final_pitch_cost=best.pitch_cost,
             initial_q_reward=baseline.q_reward,
             final_q_reward=best.q_reward,
+            repair_diagnostics=repair_diagnostics,
         )
+        if self.config.logbook_directory is not None:
+            result_data = asdict(result)
+            del result_data["logbook_path"]
+            result.logbook_path = _write_run_log(
+                Path(self.config.logbook_directory),
+                {
+                    "schema_version": 1,
+                    "started_at_utc": started_at.isoformat(),
+                    "elapsed_seconds": perf_counter() - started,
+                    "config": asdict(self.config),
+                    "archive": {
+                        "path": archive.path if archive is not None else None,
+                        "context": self._archive_context(selected_notes),
+                        "saved_genomes_at_start": saved,
+                    },
+                    "initial_rng_state": initial_rng_state,
+                    "seed_genome": seed,
+                    "generation_history": generation_history,
+                    "result": result_data,
+                },
+            )
+        return result
 
     def _evolve(
         self,
@@ -1115,10 +1267,18 @@ class GeneticGeometryOptimizer:
         rng: np.random.Generator,
         executor: ProcessPoolExecutor | None,
         progress_callback: Callable[[int, float, float, int], None] | None,
+        repair_diagnostics: list[GeneticRepairDiagnostics],
+        generation_history: list[dict[str, int | float]],
     ) -> _CandidateScore:
         for generation in range(1, self.config.generations + 1):
             scores = self._evaluate_population(population, selected_notes, executor)
             generation_best = min(scores, key=lambda score: score.rank)
+            generation_history.append({
+                "generation": generation,
+                "best_cost": generation_best.cost,
+                "best_fitness": generation_best.fitness,
+                "unique_candidates_scored": self._evaluations,
+            })
             if progress_callback is not None:
                 progress_callback(
                     generation,
@@ -1131,16 +1291,25 @@ class GeneticGeometryOptimizer:
             )[: self.config.elite_count]
             next_population = [population[index].copy() for index in elite_indices]
             seen = {self._individual_key(candidate) for candidate in next_population}
+            samples: list[tuple[np.ndarray, np.ndarray]] = []
+            self._repair_samples = samples
+            duplicate_count = 0
             while len(next_population) < self.config.population_size:
                 first = self._tournament(population, scores, rng)
                 second = self._tournament(population, scores, rng)
                 child = self._child(first, second, rng)
                 key = self._individual_key(child)
                 if key in seen:
+                    duplicate_count += 1
                     child = self._new_random_individual(seed, rng, seen)
                 else:
                     seen.add(key)
                 next_population.append(child)
+            self._repair_samples = None
+            if samples:
+                repair_diagnostics.append(
+                    self._summarize_repair(generation, seed, duplicate_count, samples)
+                )
             population = np.asarray(next_population)
 
         return min(
